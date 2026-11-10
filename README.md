@@ -6,6 +6,8 @@
 
 Built for the PayPal AI Hackathon (Oct 1 – Nov 12, 2026) by NexBridge, a Tokyo startup building payment infrastructure for licensed financial institutions.
 
+For reviewers and contributors: [design](docs/DESIGN.md) · [contributing](CONTRIBUTING.md).
+
 ## The problem
 
 AI agents are starting to buy things for people. Today there are two options, and both are bad:

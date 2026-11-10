@@ -753,6 +753,11 @@ class Gateway:
                     last = i + 1
             chain = copy.deepcopy(entries[:last])
             pp = copy.deepcopy(cart.get("paypal"))
+            # Evidence is meant to be shared, so the payer's email is masked here
+            # (also in the order read back from PayPal).
+            for part in (pp, (pp or {}).get("readback")):
+                if isinstance(part, dict) and part.get("payer_email"):
+                    part["payer_email"] = mask_email(part["payer_email"])
             return {
                 "format": "nexbridge-agent-gateway-evidence/v1",
                 "generated_at": now_iso(),

@@ -108,6 +108,23 @@ class FlowTest(unittest.TestCase):
         self.assertIsNone(g2.status()["mandate"])
         self.assertEqual(g2.ledger_entries(), [])
 
+    def test_evidence_masks_payer_email(self):
+        self.connect()
+        self.sign_mandate()
+        out = self.g.request_purchase("R-101", "train")
+        self.assertEqual(out["status"], "PAID")
+        cart_id = self.carts()["R-101"]["id"]
+        email = self.g.state["carts"][cart_id]["paypal"]["payer_email"]
+        self.assertIn("@", email)
+        bundle = self.g.evidence(cart_id)
+        self.assertNotIn(email, json.dumps(bundle, ensure_ascii=False))
+        self.assertEqual(bundle["paypal"]["payer_email"], "tr…@example.com")
+        self.assertEqual(bundle["paypal"]["readback"]["payer_email"], "tr…@example.com")
+        # Masking does not touch what the verifier checks.
+        self.assertEqual(all_pass(verify_bundle(bundle)), [])
+        # The gateway keeps the full email for itself.
+        self.assertEqual(self.g.state["carts"][cart_id]["paypal"]["payer_email"], email)
+
     def test_recheck_after_revoke_denies_approval(self):
         self.connect()
         sc = self.sign_mandate()
