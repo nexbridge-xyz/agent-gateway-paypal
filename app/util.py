@@ -121,6 +121,12 @@ def mask(text, keep: int = 4) -> str:
     return text[:keep] + "…" + text[-keep:]
 
 
+def mask_tail(text, keep: int = 2) -> str:
+    """Only the last characters of a secret: '…30'. Short values show nothing."""
+    text = str(text or "")
+    return "…" + text[-keep:] if len(text) >= keep * 4 else "…"
+
+
 def mask_email(email) -> str:
     email = str(email or "")
     if "@" not in email:

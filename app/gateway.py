@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import hmac
 import json
 import os
 import threading
@@ -19,8 +20,8 @@ from .catalog import Catalog
 from .ledger import GENESIS, Ledger, verify_entries
 from .llm import AIError
 from .paypal import PAYMENT_TIMEOUT_TEXT, PAYMENT_UNKNOWN_HINT, VAULT_HINT, PayPalError
-from .util import (CART_CONTEXT, INTENT_CONTEXT, b64url, b64url_decode, canonical_json, clean_text, display, mask,
-                   mask_email, new_id, now_iso, sha256_hex, to_minor, value_str)
+from .util import (CART_CONTEXT, INTENT_CONTEXT, b64url, b64url_decode, canonical_json, clean_text, display,
+                   mask_email, mask_tail, new_id, now_iso, sha256_hex, to_minor, value_str)
 
 AGENT = {"id": "tabi-travel-agent", "name": "Tabi · AI travel agent"}
 MERCHANT_NAME = "Tabi Travel (demo merchant)"
@@ -181,6 +182,19 @@ class Gateway:
     def paypal_connected(self) -> bool:
         return self._conn().get("status") == "connected"
 
+    def _vault_fingerprint(self, vault_id: str) -> str:
+        """Fingerprint of the vault token for the ledger: HMAC-SHA256 with a random key.
+
+        The ledger goes to the browser and into every evidence bundle. A plain hash of a
+        short token would let anyone test guesses against it; without the key that is not
+        possible. The key is made once and stays in state.json. Call with the lock held.
+        """
+        keys = self.state.setdefault("secrets", {})
+        if not keys.get("fingerprint_key"):
+            keys["fingerprint_key"] = b64url(os.urandom(32))
+        key = b64url_decode(keys["fingerprint_key"])
+        return hmac.new(key, vault_id.encode("utf-8"), hashlib.sha256).hexdigest()[:16]
+
     def paypal_begin(self, base_url: str) -> str:
         """Create a setup token and return the URL the browser should go to."""
         rid = new_id("st")
@@ -222,7 +236,7 @@ class Gateway:
             self.state["paypal"][self.paypal.env] = conn
             self.ledger.append("PAYPAL_CONNECTED", "PayPal saved for agent payments (%s)" % self.paypal.env, {
                 "env": self.paypal.env, "payer": mask_email(res.get("payer_email")),
-                "vault_token_fingerprint": fingerprint(res["vault_id"]),
+                "vault_token_fingerprint": self._vault_fingerprint(res["vault_id"]),
                 "customer_id": res.get("customer_id"),
             })
             self.save()
@@ -860,7 +874,7 @@ class Gateway:
                     "mode": self.paypal.env, "label": self.paypal.label, "live": self.paypal.live,
                     "status": conn.get("status") or "disconnected",
                     "payer": mask_email(conn.get("payer_email")) if conn.get("payer_email") else None,
-                    "vault_token": mask(conn.get("vault_id"), 2) if conn.get("vault_id") else None,
+                    "vault_token": mask_tail(conn.get("vault_id")) if conn.get("vault_id") else None,
                     "connected_at": conn.get("connected_at"), "last_error": conn.get("last_error"),
                 },
                 "ai": {"kind": self.ai.kind, "label": self.ai.label, "model": getattr(self.ai, "model", None)},

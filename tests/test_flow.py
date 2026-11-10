@@ -1,6 +1,8 @@
 """The full DEMO flow through the gateway: simulated PayPal, scripted agent,
 real signatures, real ledger, and the offline evidence verifier."""
 import copy
+import hashlib
+import hmac
 import json
 import os
 import shutil
@@ -11,7 +13,7 @@ from unittest import mock
 from app import ed25519, llm
 from app.gateway import Gateway, GatewayError, payment_status
 from app.paypal import PAYMENT_TIMEOUT_TEXT, PAYMENT_UNKNOWN_HINT, PayPalError, PayPalSimulated
-from app.util import CART_CONTEXT, b64url, canonical_json, sha256_hex
+from app.util import CART_CONTEXT, b64url, b64url_decode, canonical_json, mask_tail, sha256_hex
 from tools.verify_evidence import verify_bundle
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -406,6 +408,40 @@ class FlowTest(unittest.TestCase):
                 self.g.start_agent("Book my trip")
         self.assertFalse(self.g.agent_running)
         self.assertTrue(self.g.reset()["ok"])
+
+    def test_vault_fingerprint_needs_a_key_that_stays_in_the_state_file(self):
+        self.connect()
+        vault = self.g.state["paypal"]["simulated"]["vault_id"]
+        key = self.g.state["secrets"]["fingerprint_key"]
+        entry = self.g.ledger_entries()[0]
+        fp = entry["data"]["vault_token_fingerprint"]
+        self.assertEqual(entry["kind"], "PAYPAL_CONNECTED")
+        # Not a plain hash of the token: without the key, guesses cannot be tested against it.
+        self.assertNotEqual(fp, hashlib.sha256(vault.encode()).hexdigest()[:16])
+        self.assertEqual(fp, hmac.new(b64url_decode(key), vault.encode(), hashlib.sha256).hexdigest()[:16])
+        self.assertEqual(len(b64url_decode(key)), 32)
+        # The page shows only the last two characters of the token.
+        self.assertEqual(self.g.status()["paypal"]["vault_token"], "…" + vault[-2:])
+        # The key is in state.json and nowhere else.
+        self.sign_mandate()
+        self.g.request_purchase("R-101", "train")
+        exposed = json.dumps([self.g.status(), self.g.ledger_entries(), self.g.events_after(0),
+                              self.g.evidence(self.carts()["R-101"]["id"]), self.g.tool_get_mandate()])
+        self.assertNotIn(key, exposed)
+        self.assertNotIn(vault, exposed)
+        with open(self.g.state_path, encoding="utf-8") as f:
+            self.assertIn(key, f.read())
+        # It survives a restart and "Reset demo", so one token keeps one fingerprint.
+        g2 = Gateway(PayPalSimulated(), llm.ScriptedAI(0), self.g.state_path)
+        g2.reset()
+        self.assertEqual(g2.state["secrets"]["fingerprint_key"], key)
+        self.assertEqual(g2._vault_fingerprint(vault), fp)
+
+    def test_mask_tail_shows_only_the_end(self):
+        self.assertEqual(mask_tail("0712345678930"), "…30")
+        self.assertEqual(mask_tail("sim1a2b3c4d"), "…4d")
+        self.assertEqual(mask_tail("abcdefg"), "…")   # too short to show any of it
+        self.assertEqual(mask_tail(None), "…")
 
     def test_E1_edited_cart_does_not_verify(self):
         self.connect()
