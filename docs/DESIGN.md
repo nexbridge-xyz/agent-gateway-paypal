@@ -9,7 +9,7 @@ An AI agent that buys things for a person needs a way to pay. Giving it a card h
 - The model never decides whether money moves. Plain code does, using the signed mandate, the catalog price and the purchases so far.
 - The agent never sees payment details. The PayPal vault token stays on the server.
 - The person's consent is a signature made on their own device, not a checkbox on the server.
-- Every payment can be checked later by someone who does not trust the server, using an evidence bundle and a hash-chained ledger.
+- Every payment leaves an evidence bundle and a hash-chained ledger that a third party can check without the server: the signatures, that the cart and the capture are the ones the ledger recorded, and the chain. Sections 6 and 8 say what such a check cannot show.
 
 ## 2. Structure and trust boundaries
 
@@ -31,7 +31,7 @@ There are four parts:
 - Tool results:
   - `get_mandate`: summary, constraints, trip, budget left, purchases and pending approvals.
   - `search_inventory`: catalog items, including the merchant-written `listing_text_untrusted`.
-  - `request_purchase`: the result status, the reason, the amount, the PayPal **order id**, the budget left, or an error message. A PayPal error message can include PayPal's `debug_id`.
+  - `request_purchase`: the result status, the reason, the amount, the PayPal **order id**, the budget left, or an error message. A PayPal error message can include PayPal's `debug_id`. When the payment result is unknown, the result also carries a note not to retry the item.
 - For drafting a mandate: the traveler's instruction, today's date and the demo trip dates.
 
 **What never reaches the model:**
@@ -41,9 +41,9 @@ There are four parts:
 - Capture ids and refund ids.
 - Device public keys and signatures.
 
-**What never leaves the server:** the vault token (only a masked form such as `ab…yz` is shown), PayPal access tokens, the PayPal customer id, and the secrets in `.env`.
+**What never leaves the server:** the vault token (the page shows only its last two characters, such as `…yz`), the key of the vault token's ledger fingerprint, PayPal access tokens, and the secrets in `.env`.
 
-The other items above do reach the browser. `/api/status` shows the payer's email and the vault token only in masked form (`mask_email` and `mask` in `app/util.py`). The evidence bundle also masks the payer's email, both in its `paypal` part and in the order read back from PayPal. The bundle contains public keys, signatures and capture ids.
+The other items above do reach the browser. `/api/status` shows the payer's email and the vault token only in masked form (`mask_email` and `mask_tail` in `app/util.py`). The evidence bundle also masks the payer's email, both in its `paypal` part and in the order read back from PayPal. The bundle contains public keys, signatures and capture ids. The PayPal customer id is written into the ledger's `PAYPAL_CONNECTED` entry, so it reaches the browser (`/api/ledger`) and every evidence bundle.
 
 ## 3. Main flow
 
@@ -67,7 +67,7 @@ sequenceDiagram
     S-->>B: 302 redirect to /?paypal=connected
 ```
 
-The ledger entry stores a SHA-256 fingerprint of the vault token, not the token. In demo mode `PayPalSimulated` returns a link to `/paypal/sim-approve`, a page labelled "Simulated wallet approval (demo mode)".
+The ledger entry stores a keyed fingerprint of the vault token (HMAC-SHA256), not the token. The key is random, is made on first use and stays in `data/state.json`, so the fingerprint cannot be used to test guesses of the token. In demo mode `PayPalSimulated` returns a link to `/paypal/sim-approve`, a page labelled "Simulated wallet approval (demo mode)".
 
 ### 3.2 Draft and sign the Intent Mandate
 
@@ -112,8 +112,8 @@ sequenceDiagram
         S->>P: POST /v2/checkout/orders with vault_id (_pay, charge_vault)
         P-->>S: order and capture status
         S->>P: GET /v2/checkout/orders/{id} (get_order, read back)
-        S->>S: ledger PAYPAL_CAPTURE or PAYMENT_FAILED
-        S-->>M: PAID with order id and budget left
+        S->>S: ledger PAYPAL_CAPTURE, PAYMENT_FAILED or PAYMENT_UNKNOWN
+        S-->>M: PAID with order id and budget left, or the error
     else NEEDS_APPROVAL
         S-->>M: PENDING_APPROVAL, do not retry
     else DENIED
@@ -150,7 +150,7 @@ sequenceDiagram
 
 ### 3.5 Hijack demo, refund, revoke
 
-- **Hijack demo** (`POST /api/redteam/hijack`, `Gateway.hijack`): calls `request_purchase("H-399", ...)` with the actor `hijacked agent (simulated)`. No model is involved. It shows what happens when a model has obeyed the instruction in the H-399 listing: the same checks run and the request is denied.
+- **Hijack demo** (`POST /api/redteam/hijack`, `Gateway.hijack`): calls `request_purchase("H-399", ...)` with the actor `hijacked agent (simulated)`. No model is involved. It shows what happens when a model has obeyed the instruction in the H-399 listing: the same checks run. Under the demo mandate the request is denied. Under a mandate that allows the item, it would be paid or wait for approval like any other request.
 - **Refund** (`POST /api/purchases/{cart}/refund`, `Gateway.refund`): only a `PAID` cart with a capture id. Calls `POST /v2/payments/captures/{id}/refund` for the full amount. If PayPal answers `COMPLETED` or `PENDING`, the cart becomes `REFUNDED` and its budget is released. Ledger `PAYPAL_REFUND`.
 - **Revoke** (`POST /api/mandate/revoke`, `Gateway.revoke_mandate`): sets the mandate to `revoked` (ledger `MANDATE_REVOKED`). Later requests fail the `mandate_active` check. Carts that are waiting stay `PENDING_APPROVAL`, but approving one is denied at the re-check. Signing a new mandate marks the old one `replaced`.
 
@@ -222,7 +222,7 @@ Auto-approved carts are not signed by anyone. Their authority is the Intent Mand
 |---|---|
 | `seq` | 1, 2, 3, ... with no gaps |
 | `ts` | UTC time |
-| `kind` | `PAYPAL_CONNECTED`, `MANDATE_SIGNED`, `MANDATE_REVOKED`, `CART_DECISION`, `CART_SIGNED`, `CART_DECLINED`, `PAYPAL_CAPTURE`, `PAYPAL_REFUND`, `PAYMENT_FAILED` |
+| `kind` | `PAYPAL_CONNECTED`, `MANDATE_SIGNED`, `MANDATE_REVOKED`, `CART_DECISION`, `CART_SIGNED`, `CART_DECLINED`, `PAYPAL_CAPTURE`, `PAYPAL_REFUND`, `PAYMENT_FAILED`, `PAYMENT_UNKNOWN` |
 | `summary` | One line for people |
 | `data` | Ids, amounts, results and fingerprints. Never the vault token or keys |
 | `prev` | `hash` of the previous entry; the first entry uses 64 zeros |
@@ -241,7 +241,7 @@ Auto-approved carts are not signed by anyone. Their authority is the Intent Mand
 | `cart_approval` | The human-present record, signed string, signature, public key, key id, `alg`, or `null` |
 | `gateway_decision` | Result, reason, every check, time |
 | `gateway_recheck` | The re-check at approval, or `null` |
-| `paypal` | Order id and status, capture id and status, the payer's email (masked), environment, and the order as read back from PayPal (payer's email masked) |
+| `paypal` | Order id and status, capture id and status, the payer's email (masked), environment, and the order as read back from PayPal (payer's email masked). When the read-back succeeded, the statuses and the capture id are the ones it reported; if the first answer differed, it is kept as `first_answer` |
 | `refund` | Refund id and status, or `null` |
 | `ledger` | All entries up to the last one about this cart, and that entry's hash |
 
@@ -252,8 +252,8 @@ Auto-approved carts are not signed by anyone. Their authority is the Intent Mand
 - the cart's string matches its record and points to the mandate by id and hash;
 - if there is an approval: its string matches, its signature verifies, it was made by the mandate's key, and it is the same cart marked `HUMAN_PRESENT`;
 - the category is allowed, the cart total is within the total budget, and it is under the auto-approve limit or approved;
-- the ledger chain is intact, its head matches, and it records the signed mandate and the decision;
-- if the cart was paid: the ledger records the capture, and PayPal reported the order and capture as `COMPLETED`;
+- the ledger chain is intact, its head matches, and it records the signed mandate and the decision for exactly this cart (same cart hash and amount);
+- if the cart was paid: the ledger records the capture with the same order id, capture id and amount, the order read back is the same order, and PayPal reported the order and capture as `COMPLETED`;
 - if there is an approval: the ledger records the approval signature.
 
 ## 5. Checks
@@ -271,7 +271,7 @@ Auto-approved carts are not signed by anyone. Their authority is the Intent Mand
 | 7 | `auto_limit` | soft | The price is above `auto_approve_limit` |
 | 8 | `repeat` | soft | The same SKU is already among the purchases used |
 
-"Used" means carts under this mandate with status `PAID`, `PAYING`, `CAPTURE_PENDING` or `PENDING_APPROVAL` (`Gateway._usage`). Refunded, declined, denied and failed carts do not count.
+"Used" means carts under this mandate with status `PAID`, `PAYING`, `CAPTURE_PENDING`, `PAYMENT_UNKNOWN` or `PENDING_APPROVAL` (`Gateway._usage`). Refunded, declined, denied and failed (`NOT_EXECUTED`) carts do not count. `PAYMENT_UNKNOWN` counts because PayPal may have charged: its answer was lost or unclear.
 
 Any hard failure gives `DENIED`. Only soft failures give `NEEDS_APPROVAL`, and the cart's price is reserved in the budget while it waits. No failures gives `APPROVED`, and the gateway pays at once.
 
@@ -287,9 +287,10 @@ Any hard failure gives `DENIED`. Only soft failures give `NEEDS_APPROVAL`, and t
 | Model acting beyond its authority | The agent has three tools. It cannot set a price or a payee, and it cannot approve, refund or revoke |
 | Spending over the limits | Hard checks against the signed mandate. Waiting carts reserve budget. Hard checks run again on approval |
 | Replaying a signature | Signatures cover a context line plus the full record, including a fresh id and time. A mandate signature is accepted only for the one prepared mandate, and an approval only for a cart that is waiting and has a prepared approval |
-| Charging twice | Every payment sends `PayPal-Request-Id` set to the cart id. A refund sends `rf_` plus the cart id |
-| Changing history | The hash-chained ledger and the offline verifier |
-| Cross-site requests to the local server | POSTs with an `Origin` that does not match the server are refused. Request bodies are limited to 64 KB |
+| Charging twice | A payment is sent once, with `PayPal-Request-Id` set to the cart id. When its answer is lost or unclear, the cart becomes `PAYMENT_UNKNOWN` and keeps its amount in the budget, and the same item again is a repeat that needs the traveler's signature. A refund sends `rf_` plus the cart id, so trying it again cannot refund twice |
+| Changing history | The hash-chained ledger shows an edited entry, and a deleted entry that has entries after it. The offline verifier also checks that the cart and the capture in a bundle are the ones the ledger recorded. The limits are listed below |
+| Requests from other sites to the local server | The server answers only for its own names (`allowed_hosts` in `server.py`): `localhost`, `127.0.0.1` and `[::1]` with its port, and the host of `BASE_URL`. Any other `Host` gets 421, which covers a page that points its own domain at this machine (DNS rebinding). POSTs with a foreign `Origin` are refused |
+| Requests that are too large or cannot be stored | Request bodies are limited to 64 KB, and a negative length is refused. Text that is not valid Unicode is refused, and model output is cleaned before it is stored (`clean_text`). A connection that stays silent for 15 seconds is dropped |
 
 The HTTP server also sends `X-Content-Type-Options: nosniff`, a Content Security Policy that allows scripts only from the server itself (styles and fonts also from Google Fonts), and `Cache-Control: no-store` on API responses. Static files cannot be read from outside `static/`.
 
@@ -299,13 +300,16 @@ The HTTP server also sends `X-Content-Type-Options: nosniff`, a Content Security
 - **A compromised traveler device or browser.** Whoever controls the browser can sign with the device key.
 - **A compromised PayPal account or PayPal app credentials.**
 - **Wrong purchases inside the limits.** A model fooled by merchant text can still buy the wrong thing inside the signed limits, for example a second seat on the same train. The checks cap what it can spend, not what it picks.
+- **The holder of the ledger.** The head of the hash chain is not anchored anywhere outside the server. Whoever can write `data/state.json` can cut entries off the end or rebuild every hash, and **Reset demo** clears the ledger. An evidence bundle shows that it agrees with itself. It cannot show that the public key in it belongs to the traveler, or what PayPal really did.
+- **Anyone who can reach the server.** There is no login (see section 8).
 
 **Where secrets live:**
 
 | Secret | Where |
 |---|---|
 | Device signing key | The traveler's browser (IndexedDB), non-extractable. The server stores only the public key |
-| PayPal vault token | `data/state.json` on the server (gitignored, file mode 600). Masked in the UI. The ledger stores only its SHA-256 fingerprint. Never in events, evidence or logs |
+| PayPal vault token | `data/state.json` on the server (gitignored; set to file mode 600 after every save). The UI shows only its last two characters. The ledger stores a keyed fingerprint (HMAC-SHA256). Never in events, evidence or logs |
+| Key of the vault token fingerprint | `data/state.json` only (under `secrets`). Never sent anywhere |
 | PayPal client id and secret, AI API keys | `.env` on the server (gitignored) |
 | PayPal access token | Server memory only |
 
@@ -327,22 +331,23 @@ This project follows the shape of the Agent Payments Protocol (AP2): an Intent M
 - **Demo catalog.** Ten fictional items are hard-coded in `app/catalog.py`. There is no real merchant behind them, and prices do not change.
 - **One traveler, one mandate.** There is one active mandate at a time. Approvals must be signed with the key of the device that signed the mandate. If the browser's site data is cleared, the key is lost and a new mandate is needed.
 - **State in a JSON file.** `data/state.json` is rewritten after every change. Locking is in-process (`threading.RLock`), so only one server process should use the file.
-- **No login.** The server has no user accounts. Anyone who can reach it can use it. It binds to `127.0.0.1` by default; setting `HOST` changes that.
+- **No login.** The server has no user accounts. Anyone who can reach it can use it: any client can register its own device key and sign a new mandate, which replaces the current one. It binds to `127.0.0.1` by default; setting `HOST` changes that. Under any address other than localhost it answers only when `BASE_URL` names that address. Do not host it with real keys; a hosted demo must run with `--demo`.
 - **No webhooks or later status checks.** The status is what the Orders call returns, plus one read-back right after. A capture that stays `PENDING` is not checked again, and later reversals or disputes are not seen.
-- **A failed payment call is not looked up.** If the PayPal call fails with a network error or timeout, the cart is marked `NOT_EXECUTED`. The gateway does not check whether the order was created anyway.
+- **An unknown payment result is not resolved.** When PayPal's answer is lost or unclear, the cart becomes `PAYMENT_UNKNOWN` and keeps its amount in the budget. The gateway does not ask PayPal again later, and such a cart cannot be refunded or released in the UI; only **Reset demo** clears it. The traveler has to check the PayPal account.
 - **Refunds are full refunds** of `PAID` carts only.
-- **Evidence for current mandate only.** Evidence is available only for carts under the mandate the server holds now. After a new mandate or a reset the endpoint returns 410.
-- **The verifier checks one cart.** It does not add up budget or count across all carts in the ledger, and it imports modules from this repository.
+- **Evidence for current mandate only.** Evidence is available only for carts under the mandate the server holds now. After a new mandate the endpoint returns 410. After a reset the purchase no longer exists, and it returns 404.
+- **The verifier checks one cart.** It does not add up budget or count across all carts in the ledger, and it imports modules from this repository. Of the eight checks it repeats three: the category, the total budget for this one cart, and the auto-approve limit or an approval. It does not check the dates, merchant verification, the purchase count or the time of a revocation.
+- **The ledger head is not anchored.** Entries removed from the end of the ledger, or a ledger whose hashes were all rebuilt, still verify.
 - **Dates use UTC.** `valid_until` is compared with today's UTC date, and there is no start date check.
 - **Ed25519 code is not constant-time.** `app/ed25519.py` is used to verify signatures (and to sign in tests), not to keep secrets.
 - **The OpenAI-compatible path** has not been tested against a live provider.
-- **The hijack demo is simulated.** It calls `request_purchase` directly. It does not make a model follow the injected text.
+- **The hijack demo is simulated.** It calls `request_purchase` directly. It does not make a model follow the injected text. Its result depends on the mandate that is signed.
 
 ## 9. Code map
 
 | File | What it does |
 |---|---|
-| `server.py` | HTTP routes, `.env` loader, security headers, startup banner, simulated approval page |
+| `server.py` | HTTP routes, host and origin checks, `.env` loader, security headers, startup banner, simulated approval page |
 | `app/gateway.py` | Devices, PayPal connection, mandates, carts, approvals, payments, refunds, agent runs, events, evidence |
 | `app/policy.py` | `normalize_fields` (cleans a mandate draft) and `evaluate` (the checks) |
 | `app/paypal.py` | `PayPalSandbox` (REST client) and `PayPalSimulated` (same interface, no network) |
@@ -362,9 +367,15 @@ This project follows the shape of the Agent Payments Protocol (AP2): an Intent M
   - An HTTP error becomes a `PayPalError` with PayPal's `name`, `message`, the first item of `details` and the `debug_id`.
   - If PayPal cannot be reached, the error is `NETWORK_ERROR`.
   - If PayPal does not answer in time (40 seconds by default), the error is `TIMEOUT`.
-- **Payment error:** the cart is marked `NOT_EXECUTED`, and the ledger records `PAYMENT_FAILED` with the `debug_id`. A permission error gets a hint about enabling Vault (`VAULT_HINT`).
-- **Payment timeout:** the cart is also marked `NOT_EXECUTED`. Because PayPal may have charged anyway, the message says so: "PayPal did not answer in time. The payment may still have gone through. Check the PayPal sandbox account before you try again." (`PAYMENT_TIMEOUT_TEXT`).
-- **Status other than `COMPLETED`:** recorded as it is and not marked as paid. If the capture is `PENDING`, the cart becomes `CAPTURE_PENDING`, and its amount still counts as used.
+  - `PayPalError.sent` is false when the request never reached PayPal: an error while connecting, or any error while getting the access token.
+- **Payment refused or not sent:** if PayPal answers with a 4xx error, or the request never left, the cart is marked `NOT_EXECUTED` and its budget is free again. The ledger records `PAYMENT_FAILED` with the `debug_id`. A permission error gets a hint about enabling Vault (`VAULT_HINT`).
+- **Payment result unknown:** after a timeout, a 5xx answer, a dropped connection or an answer that cannot be read, PayPal may have charged. The cart becomes `PAYMENT_UNKNOWN` and keeps its amount in the budget, and the ledger records `PAYMENT_UNKNOWN`. The message says so: "PayPal did not answer in time. The payment may still have gone through, so its amount stays counted in the budget. Check the PayPal sandbox account." (`PAYMENT_TIMEOUT_TEXT`). The result that goes back to the agent says "Do not retry this item".
+- **Which answer counts:** with an order id, the gateway reads the order back and uses the statuses and the capture id from that read-back. If the read-back fails, it uses the first answer. `payment_status` in `app/gateway.py` then decides:
+  - order and capture `COMPLETED`: `PAID`;
+  - capture `PENDING`: `CAPTURE_PENDING`, and its amount still counts as used;
+  - capture `DECLINED` or `FAILED`, or an order that was not captured: `NOT_EXECUTED`;
+  - anything else, for example an order PayPal calls `COMPLETED` with no capture: `PAYMENT_UNKNOWN`.
+  - A status other than `COMPLETED` is never marked as paid.
 - **Refund error or timeout:** the request returns 502 with PayPal's error, and the cart's status does not change.
 - **Error from PayPal on Connect PayPal** (including a timeout): the message is stored with the connection, the page goes back to `/?paypal=error`, and the PayPal card shows the message.
 - **Access token:** the first request after start sends `ignoreCache=true`, so PayPal does not return an older cached token (for example one issued before Vault was enabled). After that, a new token is requested when the current one is within 60 seconds of expiring.

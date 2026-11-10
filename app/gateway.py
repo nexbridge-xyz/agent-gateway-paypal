@@ -810,7 +810,7 @@ class Gateway:
                 raise GatewayError("Unknown purchase.", 404)
             m = self.state["mandate"]
             if not m or m["record"]["id"] != cart["mandate_id"]:
-                raise GatewayError("The mandate for this purchase is no longer held (the demo was reset).", 410)
+                raise GatewayError("The mandate for this purchase is no longer held (a new mandate replaced it).", 410)
             entries = self.state["ledger"]
             last = 0
             for i, e in enumerate(entries):

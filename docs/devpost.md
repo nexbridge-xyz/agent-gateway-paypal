@@ -27,7 +27,7 @@ Agent Gateway sits between an AI agent and PayPal.
 - **The agent books.** In the demo, a travel agent books a Tokyo → Osaka trip. It can only search and *ask* to buy. The gateway checks every request in plain code against the signed mandate: active, dates, category, verified merchant, budget, purchase count, auto-approve limit, repeat purchase.
 - **Inside the limits, it pays.** Two $98.00 bullet train tickets are paid through PayPal with the vault token, payer not present.
 - **Above the limit, it asks.** The $236.00 hotel waits until the traveler signs a Cart Mandate. The gateway re-runs the hard checks, then pays.
-- **Outside the limits, it refuses.** One listing hides a prompt injection telling AI agents to book a $1,280.00 suite without asking. Even when the agent obeys it, the gateway denies the payment: merchant not verified, over budget. Even if the AI is fooled, it can't spend outside the limits you signed. In our live runs, Claude skipped this listing on its own and explained why. The gateway is for the times a model doesn't.
+- **Outside the limits, it refuses.** One listing hides a prompt injection telling AI agents to book a $1,280.00 suite without asking. Even when the agent obeys it, the gateway denies the payment under the signed mandate: merchant not verified, over budget. Even if the AI is fooled, it can't spend outside the limits you signed. In our live runs, Claude skipped this listing on its own and explained why. The gateway is for the times a model doesn't.
 - **Proof.** Every purchase has an evidence bundle (signed mandate, signed cart, gateway checks, PayPal order and capture IDs, the order read back from PayPal, and a hash-chained ledger) that `tools/verify_evidence.py` verifies offline.
 - **Kill switch.** Refund through PayPal (the budget comes back) or revoke the mandate (everything after is denied).
 
@@ -36,7 +36,7 @@ Agent Gateway sits between an AI agent and PayPal.
 We built it with Claude Code.
 
 - **Python 3.9+ standard library only** (`python3 server.py --demo` runs with no install), one HTML page in vanilla JS, and AG Grid Community for the ledger.
-- **PayPal REST APIs:** Vault setup tokens and payment tokens (save PayPal without a purchase), Orders v2 with `payment_source.paypal.vault_id` (payer not present), order read-back, and capture refunds. Every write sends `PayPal-Request-Id`, so a retry can never charge twice.
+- **PayPal REST APIs:** Vault setup tokens and payment tokens (save PayPal without a purchase), Orders v2 with `payment_source.paypal.vault_id` (payer not present), order read-back, and capture refunds. Every write sends `PayPal-Request-Id`. A payment is sent once. If its answer is lost, its amount stays counted in the budget, and the same item again needs the traveler's signature.
 - **AI:** Claude (Sonnet 5.5 by default) drafts the mandate with structured outputs and runs the agent with strict tool use. Without a key, a scripted agent runs the same tools through the same gateway, and the UI says so.
 - **Signatures:** WebCrypto Ed25519 in the browser (non-extractable key in IndexedDB), verified in Python by a small RFC 8032 implementation. The server builds the exact string to sign, with a different context string per record type.
 - **Ledger:** append-only, each entry stores the SHA-256 of the previous one.
@@ -50,7 +50,7 @@ We built it with Claude Code.
 
 ### Accomplishments that we're proud of
 
-- A prompt-injected agent asks for a $1,280.00 suite and the money does not move.
+- A prompt-injected agent asks for a $1,280.00 suite and, under the signed mandate, the money does not move.
 - Evidence bundles that verify offline with one short standard-library script: signatures, mandate-to-cart link, constraints, and the hash chain.
 - A demo that judges can run with one command and no accounts.
 

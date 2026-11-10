@@ -437,6 +437,22 @@ class FlowTest(unittest.TestCase):
         self.assertEqual(g2.state["secrets"]["fingerprint_key"], key)
         self.assertEqual(g2._vault_fingerprint(vault), fp)
 
+    def test_evidence_is_gone_after_a_new_mandate_or_a_reset(self):
+        self.connect()
+        self.sign_mandate()
+        self.g.request_purchase("R-101", "train")
+        cart_id = self.carts()["R-101"]["id"]
+        self.sign_mandate()  # a newer mandate replaces the one this purchase was made under
+        self.assertFalse(self.carts()["R-101"]["has_evidence"])
+        with self.assertRaises(GatewayError) as ctx:
+            self.g.evidence(cart_id)
+        self.assertEqual(ctx.exception.status, 410)
+        self.assertIn("a new mandate replaced it", str(ctx.exception))
+        self.g.reset()  # after a reset the purchase itself no longer exists
+        with self.assertRaises(GatewayError) as ctx:
+            self.g.evidence(cart_id)
+        self.assertEqual(ctx.exception.status, 404)
+
     def test_mask_tail_shows_only_the_end(self):
         self.assertEqual(mask_tail("0712345678930"), "…30")
         self.assertEqual(mask_tail("sim1a2b3c4d"), "…4d")
