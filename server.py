@@ -14,6 +14,7 @@ import html
 import json
 import mimetypes
 import os
+import socket
 import sys
 import traceback
 import urllib.parse
@@ -90,14 +91,20 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "AgentGateway/1.0"
     gateway: Gateway = None
     base_url: str = ""
+    # Seconds a client may stay silent while it sends a request. Without it, a connection
+    # that sends nothing would hold a thread for ever. Handling the request is not timed.
+    timeout = 15
 
     # -- helpers -------------------------------------------------------------
     def log_message(self, fmt, *args):
         # Short log lines; query strings are dropped so tokens never reach the log.
-        path = self.path.split("?", 1)[0]
+        command = getattr(self, "command", None)
+        if not command:
+            return  # nothing was parsed: a silent connection that timed out, or an unreadable request line
+        path = (getattr(self, "path", "") or "").split("?", 1)[0]
         if path.startswith("/api/events") or path.startswith("/api/status"):
             return
-        sys.stderr.write("  %s %s %s\n" % (self.command, path, args[1] if len(args) > 1 else ""))
+        sys.stderr.write("  %s %s %s\n" % (command, path, args[1] if len(args) > 1 else ""))
 
     def _headers(self, status: int, ctype: str, length: int, extra: dict | None = None, api: bool = True):
         self.send_response(status)
@@ -112,7 +119,8 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _json(self, obj, status: int = 200, extra: dict | None = None):
-        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        # "replace": an error text from outside with broken Unicode must still reach the page.
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8", "replace")
         self._headers(status, "application/json; charset=utf-8", len(body), extra)
         self.wfile.write(body)
 
@@ -161,17 +169,29 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             length = 0
+        if length < 0:
+            # read(-1) would read until the client closes the connection, with no limit at all.
+            raise GatewayError("Content-Length must not be negative.", 400)
         if length > MAX_BODY:
             raise GatewayError("Request body too large.", 413)
-        raw = self.rfile.read(length) if length else b""
+        try:
+            raw = self.rfile.read(length) if length else b""
+        except (socket.timeout, TimeoutError):  # Python 3.9: socket.timeout is not TimeoutError
+            raise GatewayError("The request body did not arrive in time.", 408)
         if not raw:
             return {}
         try:
             data = json.loads(raw.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
+        except (ValueError, RecursionError):
             raise GatewayError("Body must be JSON.")
         if not isinstance(data, dict):
             raise GatewayError("Body must be a JSON object.")
+        try:
+            # "\ud800" in JSON is half of a surrogate pair. It cannot be written as UTF-8,
+            # so once it is in the state every later save fails. Refuse it here.
+            json.dumps(data, ensure_ascii=False).encode("utf-8")
+        except (ValueError, RecursionError):
+            raise GatewayError("Body contains text that is not valid Unicode.")
         return data
 
     # -- static ----------------------------------------------------------------

@@ -8,7 +8,7 @@ from __future__ import annotations
 import datetime as _dt
 
 from .catalog import CATEGORIES
-from .util import display, parse_date, to_minor, today, value_str
+from .util import clean_text, display, parse_date, to_minor, today, value_str
 
 HARD = "hard"   # failing it blocks the purchase
 SOFT = "soft"   # failing it sends the purchase to the user for a signature
@@ -17,7 +17,8 @@ SOFT = "soft"   # failing it sends the purchase to the user for a signature
 def normalize_fields(raw: dict, currency: str, scenario_end: _dt.date | None = None) -> dict:
     """Clean up a mandate draft from the AI or from the edit form."""
     raw = raw or {}
-    notes = [str(n)[:160] for n in (raw.get("notes") or []) if str(n).strip()][:3]
+    # Free text in a draft can come from a model: clean_text keeps it safe to store and sign.
+    notes = [clean_text(n)[:160] for n in (raw.get("notes") or []) if str(n).strip()][:3]
 
     total = max(0, to_minor(raw.get("total_budget") or 0, currency))
     total = min(total, to_minor(1_000_000, currency))
@@ -54,7 +55,7 @@ def normalize_fields(raw: dict, currency: str, scenario_end: _dt.date | None = N
     trip_raw = raw.get("trip") or {}
     trip = {}
     for key in ("origin", "destination", "start_date", "end_date"):
-        val = str(trip_raw.get(key) or "").strip()
+        val = clean_text(trip_raw.get(key) or "").strip()
         if val:
             trip[key] = val[:60]
     try:
@@ -67,7 +68,7 @@ def normalize_fields(raw: dict, currency: str, scenario_end: _dt.date | None = N
     verified_only = raw.get("verified_merchants_only")
     verified_only = True if verified_only is None else bool(verified_only)
 
-    summary = str(raw.get("summary") or "").strip()[:240]
+    summary = clean_text(raw.get("summary") or "").strip()[:240]
     if not summary:
         summary = "Spend up to %s on %s; ask me before anything over %s." % (
             display(total, currency), ", ".join(cats) or "nothing yet", display(limit, currency))

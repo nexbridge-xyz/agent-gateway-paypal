@@ -1,10 +1,13 @@
 """HTTP layer: host and origin checks, static path containment, security headers."""
 import http.client
+import io
 import json
 import os
 import shutil
+import socket
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 import urllib.error
@@ -138,6 +141,79 @@ class ServerTest(unittest.TestCase):
     def test_body_limit(self):
         status, _, _ = self.req("/api/agent", {"text": "x" * 70000})
         self.assertEqual(status, 413)
+
+    def raw(self, data, wait=5):
+        """Send bytes exactly as given; return (status code or None, everything the server sent)."""
+        s = socket.create_connection(("127.0.0.1", self.port), timeout=wait)
+        out = b""
+        try:
+            s.sendall(data)
+            while True:
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                out += chunk
+        except socket.timeout:
+            pass
+        finally:
+            s.close()
+        parts = out.split()
+        return (int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None), out
+
+    def post_head(self, path, length):
+        return ("POST %s HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nContent-Type: application/json\r\n"
+                "Content-Length: %s\r\n\r\n" % (path, self.port, length)).encode()
+
+    def test_S5_negative_content_length(self):
+        # Before the fix the server called read(-1): it read until the client closed, with no limit.
+        # No body is sent here, so a server that waits for one shows up as a missing answer.
+        status, _ = self.raw(self.post_head("/api/agent", -1), wait=3)
+        self.assertEqual(status, 400)
+        # With a body far over the limit: nothing of it is read or acted on.
+        g = server.Handler.gateway
+        seq = g.state["event_seq"]
+        try:
+            self.raw(self.post_head("/api/agent", -1) + b'{"text":"' + b"x" * 300000 + b'"}', wait=3)
+        except OSError:
+            pass  # the server hangs up while the body is still being sent
+        time.sleep(0.3)
+        self.assertEqual(g.state["event_seq"], seq)
+
+    def test_S4_lone_surrogate_is_refused_and_the_server_stays_usable(self):
+        g = server.Handler.gateway
+        body = b'{"text":"hello \\ud800"}'            # JSON escape for half a surrogate pair
+        status, out = self.raw(self.post_head("/api/agent", len(body)) + body)
+        self.assertEqual(status, 400)
+        self.assertIn(b"not valid Unicode", out)
+        self.assertFalse(g.agent_running)
+        for path in ("/api/mandate/draft", "/api/device/register"):
+            body = b'{"instruction":"\\udfff","public_key":"\\ud800"}'
+            self.assertEqual(self.raw(self.post_head(path, len(body)) + body)[0], 400, path)
+        # Nothing unsaveable got in: polling works, and the agent can still be started and finishes.
+        self.assertEqual(self.req("/api/events?after=0")[0], 200)
+        self.assertEqual(self.req("/api/agent", {"text": "Book my trip"})[0], 200)
+        g.agent_thread.join(10)
+        self.assertFalse(g.agent_running)
+        self.assertEqual(self.req("/api/reset", {})[0], 200)
+
+    def test_deeply_nested_json_is_a_400(self):
+        body = b"[" * 60000
+        self.assertEqual(self.raw(self.post_head("/api/agent", len(body)) + body)[0], 400)
+
+    def test_silent_clients_are_dropped(self):
+        self.assertEqual(server.Handler.timeout, 15)
+        server.Handler.timeout = 0.4
+        try:
+            with mock.patch("sys.stderr", new=io.StringIO()) as err:
+                # Headers that promise a body which never comes.
+                self.assertEqual(self.raw(self.post_head("/api/agent", 10), wait=5)[0], 408)
+                # A connection that sends nothing at all is closed without an answer.
+                self.assertEqual(self.raw(b"", wait=5), (None, b""))
+                # An unreadable request line gets an error page, not a dropped connection.
+                self.assertIn(b"Error code: 400", self.raw(b"GARBAGE\r\n\r\n", wait=5)[1])
+            self.assertNotIn("Traceback", err.getvalue())
+        finally:
+            server.Handler.timeout = 15
 
     def test_sim_approve_page_is_labelled(self):
         status, _, body = self.req("/paypal/sim-approve?token=SIM-ST-1")

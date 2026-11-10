@@ -345,6 +345,68 @@ class FlowTest(unittest.TestCase):
         self.assertEqual(out["status"], "PAID")
         self.assertEqual(out["amount"], "$98.00")
 
+    def assert_state_can_be_saved(self):
+        json.dumps(self.g.state, ensure_ascii=False).encode("utf-8")
+        self.g.emit("system", text="still saving")  # raises if the state on disk can no longer be written
+        self.assertFalse(os.path.exists(self.g.state_path + ".tmp"))
+
+    def test_S4_lone_surrogate_does_not_wedge_the_agent(self):
+        text = json.loads('"hello \\ud800"')  # half of a surrogate pair, as JSON delivers it
+        try:
+            self.g.start_agent(text)
+        except Exception:
+            pass
+        if self.g.agent_thread:
+            self.g.agent_thread.join(5)
+        self.assertFalse(self.g.agent_running)
+        self.assert_state_can_be_saved()
+
+    def test_model_output_with_broken_unicode_is_made_safe(self):
+        bad = json.loads('"\\ud800"')
+
+        class BrokenTextAI(llm.ScriptedAI):
+            def run_agent(self, history, user_text, call_tool, on_text):
+                on_text("thinking " + bad)
+                call_tool("request_purchase", {"sku": "R-101", "reason": "because " + bad})
+                call_tool("request_purchase", {"sku": "X" + bad, "reason": "x"})
+                call_tool("tool" + bad, {})
+                return "done " + bad
+
+            def draft_mandate(self, instruction, today, start, end):
+                draft = super().draft_mandate(instruction, today, start, end)
+                draft.update(summary="sum " + bad, notes=["note " + bad], trip={"destination": "Osaka" + bad})
+                return draft
+
+        self.g.ai = BrokenTextAI(0)
+        self.connect()
+        fields = self.g.draft_mandate(self.g.status()["scenario"]["mandate_prompt"] + bad)["fields"]
+        p = self.g.prepare_mandate("book it " + bad, fields, self.kid)
+        self.g.activate_mandate(p["mandate_id"], self.sign(p["signing_string"]))
+        self.run_agent("Book my trip")
+        self.assertEqual(self.carts()["R-101"]["status"], "PAID")
+        texts = [e.get("text", "") for e in self.g.events_after(0)]
+        self.assertIn("done ?", texts)
+        self.assertEqual(self.g.state["carts"][self.carts()["R-101"]["id"]]["reason"], "because ?")
+        self.assert_state_can_be_saved()
+        # A restart reads the same state back.
+        g2 = Gateway(PayPalSimulated(), llm.ScriptedAI(0), os.path.join(self.tmp, "state.json"))
+        self.assertEqual(len(g2.ledger_entries()), len(self.g.ledger_entries()))
+
+    def test_failed_save_leaves_no_temporary_file(self):
+        self.connect()
+        with mock.patch("json.dump", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.g.emit("system", text="x")
+        self.assertFalse(os.path.exists(self.g.state_path + ".tmp"))
+        self.assertTrue(os.path.exists(self.g.state_path))  # the last good copy is still there
+
+    def test_agent_is_not_left_running_when_it_cannot_start(self):
+        with mock.patch.object(self.g, "emit", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.g.start_agent("Book my trip")
+        self.assertFalse(self.g.agent_running)
+        self.assertTrue(self.g.reset()["ok"])
+
     def test_chrome_webcrypto_evidence_fixture(self):
         with open(os.path.join(HERE, "fixtures", "chrome_evidence.json"), encoding="utf-8") as f:
             bundle = json.load(f)

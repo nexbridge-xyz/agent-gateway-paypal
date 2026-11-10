@@ -19,7 +19,7 @@ from .catalog import Catalog
 from .ledger import GENESIS, Ledger, verify_entries
 from .llm import AIError
 from .paypal import PAYMENT_TIMEOUT_TEXT, PAYMENT_UNKNOWN_HINT, VAULT_HINT, PayPalError
-from .util import (CART_CONTEXT, INTENT_CONTEXT, b64url, b64url_decode, canonical_json, display, mask,
+from .util import (CART_CONTEXT, INTENT_CONTEXT, b64url, b64url_decode, canonical_json, clean_text, display, mask,
                    mask_email, new_id, now_iso, sha256_hex, to_minor, value_str)
 
 AGENT = {"id": "tabi-travel-agent", "name": "Tabi · AI travel agent"}
@@ -101,9 +101,16 @@ class Gateway:
             return
         os.makedirs(os.path.dirname(self.state_path) or ".", exist_ok=True)
         tmp = self.state_path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self.state, f, ensure_ascii=False, indent=1)
-        os.replace(tmp, self.state_path)
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.state, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, self.state_path)
+        except BaseException:
+            try:
+                os.remove(tmp)  # a half-written copy would keep the vault token readable
+            except OSError:
+                pass
+            raise
         try:
             os.chmod(self.state_path, 0o600)  # the vault token lives here
         except OSError:
@@ -244,7 +251,7 @@ class Gateway:
     # mandates
     # ------------------------------------------------------------------
     def draft_mandate(self, instruction: str) -> dict:
-        instruction = str(instruction or "").strip()[:1000]
+        instruction = clean_text(instruction or "").strip()[:1000]
         if not instruction:
             raise GatewayError("Write what the agent may do first.")
         cat = self.catalog
@@ -255,7 +262,7 @@ class Gateway:
 
     def prepare_mandate(self, instruction: str, fields: dict, key_id: str) -> dict:
         self._device(key_id)
-        instruction = str(instruction or "").strip()[:1000]
+        instruction = clean_text(instruction or "").strip()[:1000]
         f = policy.normalize_fields(fields, self.currency, self.catalog.end)
         if to_minor(f["total_budget"], self.currency) <= 0:
             raise GatewayError("Set a total budget above zero.")
@@ -407,7 +414,10 @@ class Gateway:
         return {"category": category, "count": len(items), "items": items}
 
     def call_tool(self, name: str, args: dict, actor: str = "Tabi agent") -> dict:
+        # The tool name and its arguments are model output: make the text safe to store first.
+        name = clean_text(name or "")
         args = args if isinstance(args, dict) else {}
+        args = {k: clean_text(v) if isinstance(v, str) else v for k, v in args.items()}
         try:
             if name == "get_mandate":
                 out = self.tool_get_mandate()
@@ -712,38 +722,47 @@ class Gateway:
     # agent runs
     # ------------------------------------------------------------------
     def start_agent(self, text: str) -> dict:
-        text = str(text or "").strip()[:1000]
+        text = clean_text(text or "").strip()[:1000]
         if not text:
             raise GatewayError("Write a request for the agent.")
         with self.lock:
             if self.agent_running:
                 raise GatewayError("The agent is still working on the last request.", 409)
             self.agent_running = True
-        self.emit("user", text=text)
-        self.emit("agent_status", running=True, label=self.ai.label)
-        t = threading.Thread(target=self._run_agent, args=(text,), daemon=True)
-        self.agent_thread = t
-        t.start()
+        try:
+            self.emit("user", text=text)
+            self.emit("agent_status", running=True, label=self.ai.label)
+            t = threading.Thread(target=self._run_agent, args=(text,), daemon=True)
+            self.agent_thread = t
+            t.start()
+        except BaseException:
+            # Nothing is running, so the gateway must not look busy for ever.
+            with self.lock:
+                self.agent_running = False
+            raise
         return {"started": True}
 
     def _run_agent(self, text: str):
         try:
             with self.lock:
                 history = list(self.state["history"])
+            # Model output is made safe to store before it becomes an event or history.
             final = self.ai.run_agent(history, text, self.call_tool,
-                                      lambda t: self.emit("agent_text", text=t, interim=True))
-            final = (final or "").strip() or "(The agent finished without a summary. See the purchases panel.)"
+                                      lambda t: self.emit("agent_text", text=clean_text(t), interim=True))
+            final = clean_text(final or "").strip()
+            final = final or "(The agent finished without a summary. See the purchases panel.)"
             self.emit("agent_text", text=final, interim=False)
             with self.lock:
                 self.state["history"] += [{"role": "user", "text": text}, {"role": "assistant", "text": final}]
                 self.state["history"] = self.state["history"][-MAX_HISTORY * 2:]
                 self.save()
         except AIError as e:
-            print("  Agent stopped: AI error: %s" % e)
-            self.emit("error", text="Agent stopped. AI error: %s" % e)
+            detail = clean_text(e)
+            print("  Agent stopped: AI error: %s" % detail)
+            self.emit("error", text="Agent stopped. AI error: %s" % detail)
         except Exception as e:  # noqa: BLE001
             traceback.print_exc()
-            self.emit("error", text="Agent error: %s" % e)
+            self.emit("error", text="Agent error: %s" % clean_text(e))
         finally:
             with self.lock:
                 self.agent_running = False

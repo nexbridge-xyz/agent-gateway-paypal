@@ -40,6 +40,16 @@ def b64url_decode(text: str) -> bytes:
     return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
 
 
+def clean_text(text) -> str:
+    """Text that can always be saved and sent as UTF-8.
+
+    JSON may carry half of a surrogate pair ("\\ud800", a cut emoji). Python keeps it,
+    but it cannot be written as UTF-8, so one such string in the state would break
+    every later save. It becomes "?" here.
+    """
+    return str(text).encode("utf-8", "replace").decode("utf-8")
+
+
 def new_id(prefix: str) -> str:
     return prefix + "_" + secrets.token_hex(6)
 
