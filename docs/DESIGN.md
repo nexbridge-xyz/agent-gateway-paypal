@@ -328,7 +328,7 @@ This project follows the shape of the Agent Payments Protocol (AP2): an Intent M
 - **State in a JSON file.** `data/state.json` is rewritten after every change. Locking is in-process (`threading.RLock`), so only one server process should use the file.
 - **No login.** The server has no user accounts. Anyone who can reach it can use it. It binds to `127.0.0.1` by default; setting `HOST` changes that.
 - **No webhooks or later status checks.** The status is what the Orders call returns, plus one read-back right after. A capture that stays `PENDING` is not checked again, and later reversals or disputes are not seen.
-- **A failed payment call is not looked up.** If the PayPal call fails with a network error, the cart is marked `NOT_EXECUTED`. The gateway does not check whether the order was created anyway.
+- **A failed payment call is not looked up.** If the PayPal call fails with a network error or timeout, the cart is marked `NOT_EXECUTED`. The gateway does not check whether the order was created anyway.
 - **Refunds are full refunds** of `PAID` carts only.
 - **Evidence for current mandate only.** Evidence is available only for carts under the mandate the server holds now. After a new mandate or a reset the endpoint returns 410.
 - **The verifier checks one cart.** It does not add up budget or count across all carts in the ledger, and it imports modules from this repository.
@@ -354,6 +354,19 @@ This project follows the shape of the Agent Payments Protocol (AP2): an Intent M
 | `static/vendor/` | AG Grid Community (MIT), used for the ledger table |
 | `tools/verify_evidence.py` | Offline evidence verifier |
 | `tests/` | Unit tests. `tests/fixtures/chrome_evidence.json` is a bundle signed by Chrome's WebCrypto |
+
+**How PayPal errors are handled:**
+
+- Every PayPal request goes through `PayPalSandbox._open`.
+  - An HTTP error becomes a `PayPalError` with PayPal's `name`, `message`, the first item of `details` and the `debug_id`.
+  - If PayPal cannot be reached, the error is `NETWORK_ERROR`.
+  - If PayPal does not answer in time (40 seconds by default), the error is `TIMEOUT`.
+- **Payment error:** the cart is marked `NOT_EXECUTED`, and the ledger records `PAYMENT_FAILED` with the `debug_id`. A permission error gets a hint about enabling Vault (`VAULT_HINT`).
+- **Payment timeout:** the cart is also marked `NOT_EXECUTED`. Because PayPal may have charged anyway, the message says so: "PayPal did not answer in time. The payment may still have gone through. Check the PayPal sandbox account before you try again." (`PAYMENT_TIMEOUT_TEXT`).
+- **Status other than `COMPLETED`:** recorded as it is and not marked as paid. If the capture is `PENDING`, the cart becomes `CAPTURE_PENDING`, and its amount still counts as used.
+- **Refund error or timeout:** the request returns 502 with PayPal's error, and the cart's status does not change.
+- **Error from PayPal on Connect PayPal** (including a timeout): the message is stored with the connection, the page goes back to `/?paypal=error`, and the PayPal card shows the message.
+- **Access token:** the first request after start sends `ignoreCache=true`, so PayPal does not return an older cached token (for example one issued before Vault was enabled). After that, a new token is requested when the current one is within 60 seconds of expiring.
 
 **Common changes:**
 

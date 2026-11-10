@@ -6,10 +6,11 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 from app import ed25519, llm
 from app.gateway import Gateway, GatewayError
-from app.paypal import PayPalSimulated
+from app.paypal import PAYMENT_TIMEOUT_TEXT, PayPalError, PayPalSimulated
 from app.util import b64url
 from tools.verify_evidence import verify_bundle
 
@@ -124,6 +125,35 @@ class FlowTest(unittest.TestCase):
         self.assertEqual(all_pass(verify_bundle(bundle)), [])
         # The gateway keeps the full email for itself.
         self.assertEqual(self.g.state["carts"][cart_id]["paypal"]["payer_email"], email)
+
+    def test_payment_timeout_is_not_executed_with_warning(self):
+        self.connect()
+        self.sign_mandate()
+        timeout = PayPalError(0, "TIMEOUT", "PayPal did not answer within 40 seconds.")
+        with mock.patch.object(self.g.paypal, "charge_vault", side_effect=timeout):
+            out = self.g.request_purchase("R-101", "train")
+        self.assertEqual(out["status"], "NOT_EXECUTED")
+        self.assertEqual(out["error"], PAYMENT_TIMEOUT_TEXT)
+        cart = self.carts()["R-101"]
+        self.assertEqual(cart["status"], "NOT_EXECUTED")
+        self.assertEqual(cart["error"], PAYMENT_TIMEOUT_TEXT)
+        last = self.g.ledger_entries()[-1]
+        self.assertEqual(last["kind"], "PAYMENT_FAILED")
+        self.assertEqual(last["data"]["error"], PAYMENT_TIMEOUT_TEXT)
+        self.assertEqual(self.g.status()["mandate"]["budget"]["paid"], "0.00")
+
+    def test_refund_timeout_is_a_clear_error(self):
+        self.connect()
+        self.sign_mandate()
+        self.g.request_purchase("R-101", "train")
+        cart_id = self.carts()["R-101"]["id"]
+        timeout = PayPalError(0, "TIMEOUT", "PayPal did not answer within 40 seconds.")
+        with mock.patch.object(self.g.paypal, "refund", side_effect=timeout):
+            with self.assertRaises(GatewayError) as ctx:
+                self.g.refund(cart_id)
+        self.assertEqual(ctx.exception.status, 502)
+        self.assertIn("TIMEOUT", str(ctx.exception))
+        self.assertEqual(self.carts()["R-101"]["status"], "PAID")
 
     def test_recheck_after_revoke_denies_approval(self):
         self.connect()

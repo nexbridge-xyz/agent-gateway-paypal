@@ -1,10 +1,13 @@
 """PayPal client details that do not need the network."""
+import socket
 import time
 import unittest
+import urllib.error
 import urllib.parse
+import urllib.request
 from unittest import mock
 
-from app.paypal import PayPalSandbox
+from app.paypal import PayPalError, PayPalSandbox
 
 
 class TokenTest(unittest.TestCase):
@@ -26,6 +29,29 @@ class TokenTest(unittest.TestCase):
             pp.check_credentials()
         self.assertEqual(sent[0], {"grant_type": "client_credentials", "ignoreCache": "true"})
         self.assertEqual(sent[1], {"grant_type": "client_credentials"})
+
+
+class TimeoutTest(unittest.TestCase):
+    def call(self, exc):
+        pp = PayPalSandbox("id", "secret", timeout=7)
+        req = urllib.request.Request("https://api-m.sandbox.paypal.com/v2/checkout/orders")
+        with mock.patch("urllib.request.urlopen", side_effect=exc):
+            with self.assertRaises(PayPalError) as ctx:
+                pp._open(req)
+        return ctx.exception
+
+    def test_read_timeout_becomes_timeout_error(self):
+        e = self.call(socket.timeout("timed out"))
+        self.assertEqual(e.name, "TIMEOUT")
+        self.assertIn("7 seconds", e.short())
+
+    def test_connect_timeout_becomes_timeout_error(self):
+        e = self.call(urllib.error.URLError(socket.timeout("timed out")))
+        self.assertEqual(e.name, "TIMEOUT")
+
+    def test_other_network_errors_stay_network_error(self):
+        e = self.call(urllib.error.URLError(ConnectionRefusedError("refused")))
+        self.assertEqual(e.name, "NETWORK_ERROR")
 
 
 if __name__ == "__main__":

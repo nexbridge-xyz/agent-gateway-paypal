@@ -14,6 +14,7 @@ from __future__ import annotations
 import base64
 import json
 import secrets
+import socket
 import threading
 import time
 import urllib.error
@@ -22,6 +23,10 @@ import urllib.request
 
 from .util import value_str
 
+
+# Shown when a payment call times out: PayPal may have charged even though we got no answer.
+PAYMENT_TIMEOUT_TEXT = ("PayPal did not answer in time. The payment may still have gone through. "
+                        "Check the PayPal sandbox account before you try again.")
 
 # Shown after PayPal permission errors. Same wording as README → Troubleshooting.
 VAULT_HINT = ("If Vault is not enabled for the sandbox app: open the app, check Save payment methods "
@@ -91,7 +96,12 @@ class PayPalSandbox:
                               body.get("message") or body.get("error_description") or "",
                               body.get("debug_id"), body.get("details"))
         except urllib.error.URLError as e:
+            if isinstance(e.reason, (socket.timeout, TimeoutError)):
+                raise PayPalError(0, "TIMEOUT", "PayPal did not answer within %d seconds." % self._timeout)
             raise PayPalError(0, "NETWORK_ERROR", str(e.reason))
+        except (socket.timeout, TimeoutError):
+            # A timeout while waiting for or reading the response (Python 3.9: socket.timeout).
+            raise PayPalError(0, "TIMEOUT", "PayPal did not answer within %d seconds." % self._timeout)
 
     def _access_token(self) -> str:
         with self._lock:

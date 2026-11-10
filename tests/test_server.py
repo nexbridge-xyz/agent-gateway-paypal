@@ -5,6 +5,7 @@ import shutil
 import tempfile
 import threading
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
@@ -12,7 +13,7 @@ from http.server import ThreadingHTTPServer
 import server
 from app import llm
 from app.gateway import Gateway
-from app.paypal import PayPalSimulated
+from app.paypal import PayPalError, PayPalSimulated
 
 
 class ServerTest(unittest.TestCase):
@@ -72,6 +73,15 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"Simulated wallet approval (demo mode)", body)
         self.assertNotIn(b"password", body.lower())
+
+    def test_connect_timeout_shows_clear_error(self):
+        g = server.Handler.gateway
+        timeout = PayPalError(0, "TIMEOUT", "PayPal did not answer within 40 seconds.")
+        with mock.patch.object(g.paypal, "create_setup_token", side_effect=timeout):
+            status, _, body = self.req("/paypal/connect")
+        self.assertEqual(status, 200)            # redirected back to the app, not a server error
+        self.assertNotIn(b"Server error", body)
+        self.assertTrue(g.status()["paypal"]["last_error"].startswith("TIMEOUT"))
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ from . import ed25519, policy
 from .catalog import Catalog
 from .ledger import GENESIS, Ledger, verify_entries
 from .llm import AIError
-from .paypal import VAULT_HINT, PayPalError
+from .paypal import PAYMENT_TIMEOUT_TEXT, VAULT_HINT, PayPalError
 from .util import (CART_CONTEXT, INTENT_CONTEXT, b64url, b64url_decode, canonical_json, display, mask,
                    mask_email, new_id, now_iso, sha256_hex, to_minor, value_str)
 
@@ -518,10 +518,13 @@ class Gateway:
         with self.lock:
             cart = self.state["carts"][cart_id]
             if error is not None:
-                msg = error.short()
-                if self.paypal.live and error.name in ("NOT_AUTHORIZED", "PERMISSION_DENIED") or \
-                        "vault" in msg.lower():
-                    msg += " · " + VAULT_HINT
+                if error.name == "TIMEOUT":
+                    msg = PAYMENT_TIMEOUT_TEXT
+                else:
+                    msg = error.short()
+                    if self.paypal.live and error.name in ("NOT_AUTHORIZED", "PERMISSION_DENIED") or \
+                            "vault" in msg.lower():
+                        msg += " · " + VAULT_HINT
                 cart["status"] = "NOT_EXECUTED"
                 cart["error"] = msg
                 self.ledger.append("PAYMENT_FAILED", "%s not paid: %s" % (cart["sku"], error.name), {
