@@ -7,7 +7,9 @@ Live calls used:
   POST /v2/checkout/orders  (vault_id)       pay later without the payer present -> COMPLETED
   GET  /v2/checkout/orders/{id}              read the order back for the evidence record
   POST /v2/payments/captures/{id}/refund     refund a booking
-Every write sends PayPal-Request-Id, so a retry can never charge twice.
+Every write sends PayPal-Request-Id. A refund that is tried again reuses its id, so it
+cannot refund twice. A payment is never sent a second time: when its answer is lost,
+the gateway keeps the amount in the budget (PAYMENT_UNKNOWN) instead of guessing.
 """
 from __future__ import annotations
 
@@ -24,9 +26,11 @@ import urllib.request
 from .util import value_str
 
 
-# Shown when a payment call times out: PayPal may have charged even though we got no answer.
-PAYMENT_TIMEOUT_TEXT = ("PayPal did not answer in time. The payment may still have gone through. "
-                        "Check the PayPal sandbox account before you try again.")
+# Shown when PayPal's answer to a payment is lost or unclear: PayPal may have charged,
+# so the purchase keeps its amount in the budget.
+PAYMENT_UNKNOWN_HINT = ("The payment may still have gone through, so its amount stays counted in the budget. "
+                        "Check the PayPal sandbox account.")
+PAYMENT_TIMEOUT_TEXT = "PayPal did not answer in time. " + PAYMENT_UNKNOWN_HINT
 
 # Shown after PayPal permission errors. Same wording as README → Troubleshooting.
 VAULT_HINT = ("If Vault is not enabled for the sandbox app: open the app, check Save payment methods "
@@ -34,13 +38,16 @@ VAULT_HINT = ("If Vault is not enabled for the sandbox app: open the app, check 
 
 
 class PayPalError(Exception):
-    def __init__(self, status: int, name: str, message: str, debug_id=None, details=None):
+    def __init__(self, status: int, name: str, message: str, debug_id=None, details=None, sent: bool = True):
         super().__init__("%s: %s" % (name, message))
         self.status = status
         self.name = name
         self.message = message
         self.debug_id = debug_id
         self.details = details or []
+        # False when the request never reached PayPal (no connection, no access token),
+        # so nothing can have been charged. True means PayPal may have received it.
+        self.sent = sent
 
     def short(self) -> str:
         extra = ""
@@ -96,11 +103,14 @@ class PayPalSandbox:
                               body.get("message") or body.get("error_description") or "",
                               body.get("debug_id"), body.get("details"))
         except urllib.error.URLError as e:
+            # urllib raises URLError only while it connects or sends, so PayPal never got the request.
             if isinstance(e.reason, (socket.timeout, TimeoutError)):
-                raise PayPalError(0, "TIMEOUT", "PayPal did not answer within %d seconds." % self._timeout)
-            raise PayPalError(0, "NETWORK_ERROR", str(e.reason))
+                raise PayPalError(0, "TIMEOUT", "Could not reach PayPal within %d seconds." % self._timeout,
+                                  sent=False)
+            raise PayPalError(0, "NETWORK_ERROR", str(e.reason), sent=False)
         except (socket.timeout, TimeoutError):
             # A timeout while waiting for or reading the response (Python 3.9: socket.timeout).
+            # The request was sent, so PayPal may have acted on it.
             raise PayPalError(0, "TIMEOUT", "PayPal did not answer within %d seconds." % self._timeout)
 
     def _access_token(self) -> str:
@@ -125,7 +135,14 @@ class PayPalSandbox:
             return self._token
 
     def _call(self, method: str, path: str, body=None, request_id=None) -> dict:
-        headers = {"Authorization": "Bearer " + self._access_token(), "Accept": "application/json",
+        try:
+            token = self._access_token()
+        except PayPalError as e:
+            e.sent = False  # without a token the call itself was never made
+            raise
+        except Exception as e:  # noqa: BLE001 - an unreadable token answer; the call itself was never made
+            raise PayPalError(0, "TOKEN_ERROR", "Could not get a PayPal access token: %s" % e, sent=False)
+        headers = {"Authorization": "Bearer " + token, "Accept": "application/json",
                    "Content-Type": "application/json", "Prefer": "return=representation"}
         if request_id:
             headers["PayPal-Request-Id"] = request_id
@@ -227,7 +244,9 @@ class PayPalSimulated:
         return res
 
     def get_order(self, order_id):
-        return dict(self._orders.get(order_id) or {"order_id": order_id, "order_status": "UNKNOWN"})
+        if order_id not in self._orders:  # PayPal answers 404 for an order it does not know
+            raise PayPalError(404, "RESOURCE_NOT_FOUND", "The specified resource does not exist.")
+        return dict(self._orders[order_id])
 
     def refund(self, capture_id, amount_minor, currency, request_id, note):
         if request_id in self._done:

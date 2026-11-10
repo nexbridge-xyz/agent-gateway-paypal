@@ -18,7 +18,7 @@ from . import ed25519, policy
 from .catalog import Catalog
 from .ledger import GENESIS, Ledger, verify_entries
 from .llm import AIError
-from .paypal import PAYMENT_TIMEOUT_TEXT, VAULT_HINT, PayPalError
+from .paypal import PAYMENT_TIMEOUT_TEXT, PAYMENT_UNKNOWN_HINT, VAULT_HINT, PayPalError
 from .util import (CART_CONTEXT, INTENT_CONTEXT, b64url, b64url_decode, canonical_json, display, mask,
                    mask_email, new_id, now_iso, sha256_hex, to_minor, value_str)
 
@@ -28,9 +28,25 @@ BRAND_NAME = "Tabi Travel (demo)"
 MAX_EVENTS = 600
 MAX_HISTORY = 8  # user/agent turns kept for follow-ups
 
-# Cart statuses that hold budget.
-COMMITTED = ("PAYING", "PAID", "CAPTURE_PENDING")
+# Cart statuses that hold budget. PAYMENT_UNKNOWN: PayPal's answer was lost or unclear,
+# so the money may have moved and the amount stays counted.
+COMMITTED = ("PAYING", "PAID", "CAPTURE_PENDING", "PAYMENT_UNKNOWN")
 RESERVED = ("PENDING_APPROVAL",)
+
+# PayPal order statuses that mean nothing was captured.
+NOT_CAPTURED = ("CREATED", "SAVED", "APPROVED", "PAYER_ACTION_REQUIRED", "VOIDED")
+UNKNOWN_NOTE = "Do not retry this item. Tell the traveler to check it in PayPal."
+
+
+def payment_status(order_status, capture_status) -> str:
+    """Cart status for what PayPal reported. Only a clear "no money moved" frees the budget."""
+    if order_status == "COMPLETED" and capture_status == "COMPLETED":
+        return "PAID"
+    if capture_status == "PENDING":
+        return "CAPTURE_PENDING"
+    if capture_status in ("DECLINED", "FAILED") or (capture_status is None and order_status in NOT_CAPTURED):
+        return "NOT_EXECUTED"
+    return "PAYMENT_UNKNOWN"
 
 
 class GatewayError(Exception):
@@ -482,18 +498,29 @@ class Gateway:
                     "note": "The traveler must approve and sign this purchase. Do not retry it; continue."}
         return self._pay(cart_id)
 
+    def _unpaid(self, cart: dict, status: str, msg: str, why: str, data: dict | None = None) -> dict:
+        """Close a cart that was not paid (NOT_EXECUTED), or not clearly paid (PAYMENT_UNKNOWN,
+        which keeps its amount in the budget). Call with the lock held."""
+        unknown = status == "PAYMENT_UNKNOWN"
+        cart["status"] = status
+        cart["error"] = msg
+        self.ledger.append("PAYMENT_UNKNOWN" if unknown else "PAYMENT_FAILED",
+                           "%s %s: %s" % (cart["sku"], "payment result unknown" if unknown else "not paid", why),
+                           dict(data or {}, cart_id=cart["id"], error=msg))
+        self.save()
+        self.emit("payment_failed", cart_id=cart["id"], sku=cart["sku"], error=msg, status=status)
+        out = {"status": status, "sku": cart["sku"], "error": msg}
+        if unknown:
+            out["note"] = UNKNOWN_NOTE
+        return out
+
     def _pay(self, cart_id: str) -> dict:
         with self.lock:
             cart = self.state["carts"][cart_id]
             conn = self._conn()
             if conn.get("status") != "connected" or not conn.get("vault_id"):
-                cart["status"] = "NOT_EXECUTED"
-                cart["error"] = "PayPal is not connected. Connect PayPal first."
-                self.ledger.append("PAYMENT_FAILED", "%s not paid: PayPal not connected" % cart["sku"],
-                                   {"cart_id": cart_id, "error": cart["error"]})
-                self.save()
-                self.emit("payment_failed", cart_id=cart_id, sku=cart["sku"], error=cart["error"])
-                return {"status": "NOT_EXECUTED", "sku": cart["sku"], "error": cart["error"]}
+                return self._unpaid(cart, "NOT_EXECUTED", "PayPal is not connected. Connect PayPal first.",
+                                    "PayPal not connected")
             vault_id = conn["vault_id"]
             cart["status"] = "PAYING"
             self.save()
@@ -515,55 +542,57 @@ class Gateway:
                 readback = self.paypal.get_order(res["order_id"])
             except PayPalError as e:
                 readback = {"error": e.short()}
+            except Exception as e:  # noqa: BLE001 - the charge has its answer; a failed read-back must not lose it
+                readback = {"error": "GATEWAY_ERROR: %s" % e}
         with self.lock:
             cart = self.state["carts"][cart_id]
             if error is not None:
-                if error.name == "TIMEOUT":
-                    msg = PAYMENT_TIMEOUT_TEXT
-                else:
+                # "Not paid" needs a clear refusal from PayPal (4xx) or a request that never left.
+                # Anything else may have been charged, so the cart keeps its amount in the budget.
+                if error.sent is False or 400 <= error.status < 500:
                     msg = error.short()
                     if self.paypal.live and error.name in ("NOT_AUTHORIZED", "PERMISSION_DENIED") or \
                             "vault" in msg.lower():
                         msg += " · " + VAULT_HINT
-                cart["status"] = "NOT_EXECUTED"
-                cart["error"] = msg
-                self.ledger.append("PAYMENT_FAILED", "%s not paid: %s" % (cart["sku"], error.name), {
-                    "cart_id": cart_id, "error": msg, "debug_id": error.debug_id})
-                self.save()
-                self.emit("payment_failed", cart_id=cart_id, sku=cart["sku"], error=msg)
-                return {"status": "NOT_EXECUTED", "sku": cart["sku"], "error": msg}
-            cart["paypal"] = dict(res, env=self.paypal.env, readback=readback, at=now_iso())
-            ok = res.get("order_status") == "COMPLETED" and res.get("capture_status") == "COMPLETED"
-            if ok:
-                cart["status"] = "PAID"
-            elif res.get("capture_status") == "PENDING":
-                cart["status"] = "CAPTURE_PENDING"
-            else:
-                cart["status"] = "NOT_EXECUTED"
-                cart["error"] = "PayPal order status %s, capture status %s: not marked as paid." % (
-                    res.get("order_status"), res.get("capture_status"))
-            kind = "PAYPAL_CAPTURE" if cart["status"] in ("PAID", "CAPTURE_PENDING") else "PAYMENT_FAILED"
-            self.ledger.append(kind, "%s %s · PayPal %s / %s" % (
-                cart["sku"], display(cart["price_minor"], self.currency), res.get("order_status"),
-                res.get("capture_status")), {
-                "cart_id": cart_id, "amount": value_str(cart["price_minor"], self.currency),
-                "currency": self.currency, "order_id": res.get("order_id"), "capture_id": res.get("capture_id"),
-                "order_status": res.get("order_status"), "capture_status": res.get("capture_status"),
-                "env": self.paypal.env})
+                    return self._unpaid(cart, "NOT_EXECUTED", msg, error.name, {"debug_id": error.debug_id})
+                msg = PAYMENT_TIMEOUT_TEXT if error.name == "TIMEOUT" else error.short() + " · " + PAYMENT_UNKNOWN_HINT
+                return self._unpaid(cart, "PAYMENT_UNKNOWN", msg, error.name, {
+                    "debug_id": error.debug_id, "amount": value_str(cart["price_minor"], self.currency),
+                    "currency": self.currency})
+            # With an order id, what PayPal says when the order is read back decides. Fields the
+            # read-back does not report, and a read-back that failed, fall back to the first answer.
+            keys = ("order_status", "capture_id", "capture_status")
+            first = {k: res.get(k) for k in keys}
+            pp = dict(res, env=self.paypal.env, readback=readback, at=now_iso())
+            if isinstance(readback, dict) and not readback.get("error"):
+                pp.update({k: readback[k] for k in keys if readback.get(k)})
+                if any(pp.get(k) != first[k] for k in keys):
+                    pp["first_answer"] = first
+            cart["paypal"] = pp
+            status = payment_status(pp.get("order_status"), pp.get("capture_status"))
+            seen = "PayPal %s / %s" % (pp.get("order_status"), pp.get("capture_status"))
+            data = {"cart_id": cart_id, "amount": value_str(cart["price_minor"], self.currency),
+                    "currency": self.currency, "order_id": pp.get("order_id"), "capture_id": pp.get("capture_id"),
+                    "order_status": pp.get("order_status"), "capture_status": pp.get("capture_status"),
+                    "env": self.paypal.env}
+            if status in ("NOT_EXECUTED", "PAYMENT_UNKNOWN"):
+                msg = "PayPal order status %s, capture status %s: not marked as paid." % (
+                    pp.get("order_status"), pp.get("capture_status"))
+                if status == "PAYMENT_UNKNOWN":
+                    msg += " " + PAYMENT_UNKNOWN_HINT
+                return self._unpaid(cart, status, msg, seen, data)
+            cart["status"] = status
+            self.ledger.append("PAYPAL_CAPTURE", "%s %s · %s" % (
+                cart["sku"], display(cart["price_minor"], self.currency), seen), data)
             self.save()
             left = self.mandate_view()["budget"]["left"]
-            status = cart["status"]
-        if status == "NOT_EXECUTED":
-            self.emit("payment_failed", cart_id=cart_id, sku=cart["sku"], error=cart["error"])
-            return {"status": "NOT_EXECUTED", "sku": cart["sku"], "error": cart["error"]}
         self.emit("receipt", cart_id=cart_id, sku=cart["sku"], title=item["title"],
-                  price=display(cart["price_minor"], self.currency), order_id=res.get("order_id"),
-                  capture_id=res.get("capture_id"), order_status=res.get("order_status"),
-                  capture_status=res.get("capture_status"), env=self.paypal.env)
-        out = {"status": "PAID" if status == "PAID" else "CAPTURE_PENDING", "sku": cart["sku"],
-               "amount": display(cart["price_minor"], self.currency), "paypal_order_id": res.get("order_id"),
-               "budget_left": display(to_minor(left, self.currency), self.currency)}
-        return out
+                  price=display(cart["price_minor"], self.currency), order_id=pp.get("order_id"),
+                  capture_id=pp.get("capture_id"), order_status=pp.get("order_status"),
+                  capture_status=pp.get("capture_status"), env=self.paypal.env)
+        return {"status": status, "sku": cart["sku"],
+                "amount": display(cart["price_minor"], self.currency), "paypal_order_id": pp.get("order_id"),
+                "budget_left": display(to_minor(left, self.currency), self.currency)}
 
     # ------------------------------------------------------------------
     # approvals (human present)

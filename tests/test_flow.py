@@ -9,8 +9,8 @@ import unittest
 from unittest import mock
 
 from app import ed25519, llm
-from app.gateway import Gateway, GatewayError
-from app.paypal import PAYMENT_TIMEOUT_TEXT, PayPalError, PayPalSimulated
+from app.gateway import Gateway, GatewayError, payment_status
+from app.paypal import PAYMENT_TIMEOUT_TEXT, PAYMENT_UNKNOWN_HINT, PayPalError, PayPalSimulated
 from app.util import b64url
 from tools.verify_evidence import verify_bundle
 
@@ -126,21 +126,170 @@ class FlowTest(unittest.TestCase):
         # The gateway keeps the full email for itself.
         self.assertEqual(self.g.state["carts"][cart_id]["paypal"]["payer_email"], email)
 
-    def test_payment_timeout_is_not_executed_with_warning(self):
+    def test_P1_timeout_must_keep_the_budget(self):
         self.connect()
         self.sign_mandate()
         timeout = PayPalError(0, "TIMEOUT", "PayPal did not answer within 40 seconds.")
         with mock.patch.object(self.g.paypal, "charge_vault", side_effect=timeout):
-            out = self.g.request_purchase("R-101", "train")
-        self.assertEqual(out["status"], "NOT_EXECUTED")
+            self.g.request_purchase("R-101", "train")
+        # The result is unknown: the budget stays held, and the same SKU is not paid again on its own.
+        self.assertNotEqual(self.g.status()["mandate"]["budget"]["left"], "600.00")
+        self.assertNotEqual(self.g.request_purchase("R-101", "retry")["status"], "PAID")
+
+    def test_payment_timeout_is_unknown_and_keeps_the_budget(self):
+        self.connect()
+        self.sign_mandate()
+        timeout = PayPalError(0, "TIMEOUT", "PayPal did not answer within 40 seconds.")
+        with mock.patch.object(self.g.paypal, "charge_vault", side_effect=timeout):
+            out = self.g.call_tool("request_purchase", {"sku": "R-101", "reason": "train"})
+        self.assertEqual(out["status"], "PAYMENT_UNKNOWN")
         self.assertEqual(out["error"], PAYMENT_TIMEOUT_TEXT)
+        self.assertIn("Do not retry this item", out["note"])
         cart = self.carts()["R-101"]
-        self.assertEqual(cart["status"], "NOT_EXECUTED")
+        self.assertEqual(cart["status"], "PAYMENT_UNKNOWN")
         self.assertEqual(cart["error"], PAYMENT_TIMEOUT_TEXT)
         last = self.g.ledger_entries()[-1]
-        self.assertEqual(last["kind"], "PAYMENT_FAILED")
+        self.assertEqual(last["kind"], "PAYMENT_UNKNOWN")
         self.assertEqual(last["data"]["error"], PAYMENT_TIMEOUT_TEXT)
-        self.assertEqual(self.g.status()["mandate"]["budget"]["paid"], "0.00")
+        self.assertEqual(last["data"]["amount"], "98.00")
+        event = [e for e in self.g.events_after(0) if e["kind"] == "payment_failed"][-1]
+        self.assertEqual(event["status"], "PAYMENT_UNKNOWN")
+        # It holds budget and a purchase count, and it shows up as a purchase for the agent.
+        budget = self.g.status()["mandate"]["budget"]
+        self.assertEqual((budget["paid"], budget["left"], budget["count"]), ("98.00", "502.00", 1))
+        self.assertEqual([p["status"] for p in self.g.tool_get_mandate()["purchases"]], ["PAYMENT_UNKNOWN"])
+        # Asking for the same item again is a repeat, so it waits for the traveler.
+        again = self.g.call_tool("request_purchase", {"sku": "R-101", "reason": "retry"})
+        self.assertEqual(again["status"], "PENDING_APPROVAL")
+        failed = [c["key"] for c in self.g.state["carts"][self.g.state["cart_order"][-1]]["decision"]["checks"]
+                  if not c["ok"]]
+        self.assertEqual(failed, ["repeat"])
+        # There is no capture to refund.
+        with self.assertRaises(GatewayError) as ctx:
+            self.g.refund(cart["id"])
+        self.assertEqual(ctx.exception.status, 409)
+        self.assertTrue(self.g.verify_ledger()["ok"])
+
+    def test_clear_refusal_or_unsent_request_is_not_executed(self):
+        self.connect()
+        self.sign_mandate()
+        errors = [PayPalError(422, "UNPROCESSABLE_ENTITY", "The instrument was declined."),
+                  PayPalError(429, "RATE_LIMIT_REACHED", "Too many requests."),
+                  PayPalError(0, "NETWORK_ERROR", "Connection refused", sent=False),
+                  PayPalError(0, "TIMEOUT", "Could not reach PayPal within 40 seconds.", sent=False)]
+        for error in errors:
+            with self.subTest(error=error.name):
+                with mock.patch.object(self.g.paypal, "charge_vault", side_effect=error):
+                    out = self.g.call_tool("request_purchase", {"sku": "R-101", "reason": "train"})
+                self.assertEqual(out["status"], "NOT_EXECUTED")
+                self.assertEqual(out["error"], error.short())
+                self.assertNotIn("note", out)
+                self.assertEqual(self.g.ledger_entries()[-1]["kind"], "PAYMENT_FAILED")
+                budget = self.g.status()["mandate"]["budget"]
+                self.assertEqual((budget["paid"], budget["count"]), ("0.00", 0))
+
+    def test_lost_or_unclear_answers_are_unknown(self):
+        self.connect()
+        self.sign_mandate()
+        cases = [("R-101", PayPalError(500, "INTERNAL_SERVER_ERROR", "An internal server error has occurred.")),
+                 ("R-201", PayPalError(503, "HTTP_503", "")),
+                 ("H-302", ConnectionResetError("Remote end closed connection without response"))]
+        for sku, error in cases:
+            with self.subTest(error=type(error).__name__):
+                with mock.patch.object(self.g.paypal, "charge_vault", side_effect=error):
+                    out = self.g.call_tool("request_purchase", {"sku": sku, "reason": "x"})
+                self.assertEqual(out["status"], "PAYMENT_UNKNOWN")
+                self.assertTrue(out["error"].endswith(PAYMENT_UNKNOWN_HINT))
+                self.assertEqual(self.g.ledger_entries()[-1]["kind"], "PAYMENT_UNKNOWN")
+        budget = self.g.status()["mandate"]["budget"]
+        self.assertEqual((budget["paid"], budget["count"]), ("274.00", 3))
+
+    def test_read_back_decides_when_the_first_answer_has_no_capture(self):
+        self.connect()
+        self.sign_mandate()
+        first = {"order_id": "O1", "order_status": "COMPLETED", "capture_id": None, "capture_status": None,
+                 "payer_email": None}
+        back = {"order_id": "O1", "order_status": "COMPLETED", "capture_id": "C1", "capture_status": "COMPLETED"}
+        with mock.patch.object(self.g.paypal, "charge_vault", return_value=first), \
+                mock.patch.object(self.g.paypal, "get_order", return_value=back):
+            out = self.g.request_purchase("R-101", "train")
+        self.assertEqual(out["status"], "PAID")
+        cart_id = self.carts()["R-101"]["id"]
+        paypal = self.g.state["carts"][cart_id]["paypal"]
+        self.assertEqual((paypal["capture_id"], paypal["capture_status"]), ("C1", "COMPLETED"))
+        self.assertEqual(paypal["first_answer"], {"order_status": "COMPLETED", "capture_id": None,
+                                                  "capture_status": None})
+        self.assertEqual(all_pass(verify_bundle(json.loads(json.dumps(self.g.evidence(cart_id))))), [])
+        self.assertEqual(self.g.refund(cart_id)["status"], "REFUNDED")  # the capture id came from the read-back
+
+    def test_read_back_overrules_the_first_answer(self):
+        self.connect()
+        self.sign_mandate()
+        first = {"order_id": "O1", "order_status": "COMPLETED", "capture_id": "C1", "capture_status": "COMPLETED"}
+        back = {"order_id": "O1", "order_status": "COMPLETED", "capture_id": "C1", "capture_status": "PENDING"}
+        with mock.patch.object(self.g.paypal, "charge_vault", return_value=first), \
+                mock.patch.object(self.g.paypal, "get_order", return_value=back):
+            out = self.g.request_purchase("R-101", "train")
+        self.assertEqual(out["status"], "CAPTURE_PENDING")
+        self.assertEqual(self.g.status()["mandate"]["budget"]["paid"], "98.00")
+
+    def test_completed_order_without_capture_is_unknown_when_the_read_back_fails(self):
+        self.connect()
+        self.sign_mandate()
+        first = {"order_id": "O1", "order_status": "COMPLETED", "capture_id": None, "capture_status": None}
+        # The simulator does not know order O1, so the read-back fails with 404.
+        with mock.patch.object(self.g.paypal, "charge_vault", return_value=first):
+            out = self.g.request_purchase("R-101", "train")
+        self.assertEqual(out["status"], "PAYMENT_UNKNOWN")
+        paypal = self.g.state["carts"][self.carts()["R-101"]["id"]]["paypal"]
+        self.assertIn("RESOURCE_NOT_FOUND", paypal["readback"]["error"])
+        last = self.g.ledger_entries()[-1]
+        self.assertEqual((last["kind"], last["data"]["order_id"]), ("PAYMENT_UNKNOWN", "O1"))
+        self.assertEqual(self.g.status()["mandate"]["budget"]["paid"], "98.00")
+
+    def test_a_first_answer_that_is_clear_stands_when_the_read_back_fails(self):
+        self.connect()
+        self.sign_mandate()
+        first = {"order_id": "O1", "order_status": "COMPLETED", "capture_id": "C1", "capture_status": "COMPLETED"}
+        with mock.patch.object(self.g.paypal, "charge_vault", return_value=first), \
+                mock.patch.object(self.g.paypal, "get_order", side_effect=ConnectionResetError("reset")):
+            out = self.g.request_purchase("R-101", "train")
+        self.assertEqual(out["status"], "PAID")
+        self.assertNotIn("first_answer", self.g.state["carts"][self.carts()["R-101"]["id"]]["paypal"])
+
+    def test_declined_or_uncaptured_orders_are_not_executed(self):
+        self.connect()
+        self.sign_mandate()
+        answers = [{"order_id": "O1", "order_status": "COMPLETED", "capture_id": "C1", "capture_status": "DECLINED"},
+                   {"order_id": "O2", "order_status": "PAYER_ACTION_REQUIRED", "capture_id": None,
+                    "capture_status": None}]
+        for answer in answers:
+            with self.subTest(order=answer["order_status"], capture=answer["capture_status"]):
+                with mock.patch.object(self.g.paypal, "charge_vault", return_value=answer):
+                    out = self.g.request_purchase("R-101", "train")
+                self.assertEqual(out["status"], "NOT_EXECUTED")
+                self.assertEqual(self.g.ledger_entries()[-1]["kind"], "PAYMENT_FAILED")
+                self.assertEqual(self.g.status()["mandate"]["budget"]["paid"], "0.00")
+
+    def test_payment_status_table(self):
+        self.assertEqual(payment_status("COMPLETED", "COMPLETED"), "PAID")
+        self.assertEqual(payment_status("COMPLETED", "PENDING"), "CAPTURE_PENDING")
+        for order, capture in (("COMPLETED", "DECLINED"), ("COMPLETED", "FAILED"), ("CREATED", None),
+                               ("APPROVED", None), ("PAYER_ACTION_REQUIRED", None), ("VOIDED", None)):
+            self.assertEqual(payment_status(order, capture), "NOT_EXECUTED", (order, capture))
+        for order, capture in (("COMPLETED", None), (None, None), ("SOMETHING_NEW", None), ("APPROVED", "COMPLETED"),
+                               ("COMPLETED", "REFUNDED")):
+            self.assertEqual(payment_status(order, capture), "PAYMENT_UNKNOWN", (order, capture))
+
+    def test_scripted_agent_reports_an_unknown_payment(self):
+        self.connect()
+        self.sign_mandate()
+        timeout = PayPalError(0, "TIMEOUT", "PayPal did not answer within 40 seconds.")
+        with mock.patch.object(self.g.paypal, "charge_vault", side_effect=timeout):
+            self.run_agent("Book the bullet train from Tokyo to Osaka")
+        final = [e["text"] for e in self.g.events_after(0) if e["kind"] == "agent_text" and not e.get("interim")][-1]
+        self.assertIn("Payment result unknown", final)
+        self.assertNotIn("Not booked", final)
 
     def test_refund_timeout_is_a_clear_error(self):
         self.connect()

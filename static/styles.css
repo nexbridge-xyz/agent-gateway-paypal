@@ -199,7 +199,7 @@ em { color: var(--text); font-style: italic; }
   white-space: nowrap;
 }
 .pill.ok, .pill.APPROVED, .pill.PAID { color: var(--signal); background: var(--signal-bg); }
-.pill.wait, .pill.NEEDS_APPROVAL, .pill.PENDING_APPROVAL, .pill.PAYING, .pill.CAPTURE_PENDING { color: var(--amber); background: var(--amber-bg); }
+.pill.wait, .pill.NEEDS_APPROVAL, .pill.PENDING_APPROVAL, .pill.PAYING, .pill.CAPTURE_PENDING, .pill.PAYMENT_UNKNOWN { color: var(--amber); background: var(--amber-bg); }
 .pill.bad, .pill.DENIED, .pill.NOT_EXECUTED { color: var(--red); background: var(--red-bg); }
 .pill.pp, .pill.REFUNDED { color: var(--blue); background: var(--blue-bg); }
 .pill.DECLINED, .pill.muted { color: var(--muted); }

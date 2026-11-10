@@ -106,6 +106,14 @@ class OpenAICompatTest(unittest.TestCase):
                 ai.run_agent([], "x", lambda n, a: {}, lambda t: None)
 
 
+class PromptTest(unittest.TestCase):
+    def test_the_model_is_told_not_to_retry_an_unknown_payment(self):
+        tool = [t for t in llm.AGENT_TOOLS if t["name"] == "request_purchase"][0]
+        for text in (llm.AGENT_SYSTEM, tool["description"]):
+            self.assertIn("PAYMENT_UNKNOWN", text)
+            self.assertIn("do not retry the item", text.lower())
+
+
 class ScriptedDraftTest(unittest.TestCase):
     def test_parses_demo_instruction(self):
         d = llm.ScriptedAI(0).draft_mandate(

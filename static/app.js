@@ -532,6 +532,7 @@ function decisionCard(ev) {
 const STATUS_LABEL = {
   PAYING: "APPROVED · paying", PAID: "PAID", CAPTURE_PENDING: "CAPTURE PENDING", PENDING_APPROVAL: "Waiting for your signature",
   DENIED: "DENIED", DECLINED: "DECLINED", REFUNDED: "REFUNDED", NOT_EXECUTED: "NOT EXECUTED",
+  PAYMENT_UNKNOWN: "PAYMENT UNKNOWN",
 };
 // Model output stays plain text (it can quote untrusted merchant listings), so it is never
 // rendered as HTML. This only removes Markdown emphasis and heading marks; line breaks are kept by CSS.
@@ -573,12 +574,15 @@ function renderEvent(ev) {
         h("span", { class: "ids" }, h("span", { text: "order " }), ev.order_id, h("span", { text: " · capture " }), ev.capture_id || "—"),
         h("span", { class: "amt", text: ev.price })));
       break;
-    case "payment_failed":
-      setCardStatus(ev.cart_id, "NOT_EXECUTED");
+    case "payment_failed": {
+      // PAYMENT_UNKNOWN: PayPal's answer was lost, so the amount stays counted in the budget.
+      const st = ev.status === "PAYMENT_UNKNOWN" ? "PAYMENT_UNKNOWN" : "NOT_EXECUTED";
+      setCardStatus(ev.cart_id, st);
       feedAppend(h("div", { class: "decision DENIED" },
-        h("div", { class: "top" }, h("span", { class: "title", text: "Payment not executed · " + ev.sku }), h("span", { class: "pill NOT_EXECUTED", text: "NOT EXECUTED" })),
+        h("div", { class: "top" }, h("span", { class: "title", text: (st === "PAYMENT_UNKNOWN" ? "Payment result unknown · " : "Payment not executed · ") + ev.sku }), h("span", { class: "pill " + st, text: STATUS_LABEL[st] })),
         h("div", { class: "meta", text: ev.error })));
       break;
+    }
     case "system":
       feedAppend(h("div", { class: "row-sys", text: ev.text }));
       break;
