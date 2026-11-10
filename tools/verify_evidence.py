@@ -3,7 +3,7 @@
 
     python3 tools/verify_evidence.py evidence.json
 
-Checks, with no network and no trust in the gateway:
+Checks, with no network, that the bundle agrees with itself:
   1. The Intent Mandate signature (Ed25519) verifies, and the signed string is
      exactly CONTEXT + canonical JSON of the mandate record.
   2. The key id is the SHA-256 prefix of the public key, and it is the mandate's principal.
@@ -12,7 +12,11 @@ Checks, with no network and no trust in the gateway:
      same device key, and the approved cart is the same cart.
   5. The purchase fits the signed constraints (category, budget, auto-approve limit or approval).
   6. The ledger hash chain is intact from genesis to the head, and it records the mandate,
-     the decision and the PayPal capture for this cart.
+     the decision for exactly this cart (same cart hash and amount) and the PayPal capture
+     (same order id, capture id and amount).
+What it cannot show: that the public key belongs to the traveler, that PayPal really moved
+the money (the PayPal part is what the gateway recorded), or that the holder of the ledger
+did not rebuild it or cut entries off its end. Those need information from outside the bundle.
 Exit code 0 when every check passes, 1 otherwise. Python 3.9+ standard library only.
 """
 from __future__ import annotations
@@ -31,6 +35,10 @@ from app.util import CART_CONTEXT, INTENT_CONTEXT, b64url_decode, canonical_json
 
 def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _same_amount(value, total: int, currency: str) -> bool:
+    return value is not None and to_minor(value, currency) == total
 
 
 def verify_bundle(bundle: dict) -> list:
@@ -107,14 +115,23 @@ def verify_bundle(bundle: dict) -> list:
     check(any(k == "MANDATE_SIGNED" and d.get("mandate_id") == rec.get("id") and
               d.get("signed_hash") == _sha(im.get("signed_string") or "") for k, d in kinds),
           "Ledger: records this signed mandate")
-    check(any(k == "CART_DECISION" and d.get("cart_id") == cart_id for k, d in kinds),
-          "Ledger: records the gateway decision for this cart")
+    # An auto-approved cart is signed by nobody. What ties the cart in this bundle to the cart the
+    # gateway decided on and paid is the cart hash and the amount the gateway wrote into the ledger.
+    cart_hash = _sha(cm.get("signed_string") or "")
+    decisions = [d for k, d in kinds if k == "CART_DECISION" and d.get("cart_id") == cart_id]
+    decided = [d for d in decisions if d.get("cart_hash") == cart_hash and _same_amount(d.get("amount"), total, cur)]
+    check(decided, "Ledger: records the gateway decision for this cart",
+          "" if decided else "no decision entry for this cart" if not decisions else
+          "the cart in the bundle is not the cart that was decided on: hash or amount differs")
     pp = bundle.get("paypal") or {}
     if pp.get("capture_id"):
         check(any(k == "PAYPAL_CAPTURE" and d.get("cart_id") == cart_id and d.get("capture_id") == pp["capture_id"]
+                  and d.get("order_id") == pp.get("order_id") and _same_amount(d.get("amount"), total, cur)
                   for k, d in kinds),
               "Ledger: records the PayPal capture", "%s / capture %s" % (pp.get("order_id"), pp.get("capture_id")))
-        check(pp.get("order_status") == "COMPLETED" and pp.get("capture_status") == "COMPLETED",
+        back = pp.get("readback") or {}
+        check(pp.get("order_status") == "COMPLETED" and pp.get("capture_status") == "COMPLETED"
+              and back.get("order_id") in (None, pp.get("order_id")),
               "PayPal: order and capture COMPLETED", "%s (%s)" % (pp.get("order_status"), pp.get("env")))
     if approval:
         check(any(k == "CART_SIGNED" and d.get("cart_id") == cart_id and

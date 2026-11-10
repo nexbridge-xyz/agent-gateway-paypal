@@ -11,7 +11,7 @@ from unittest import mock
 from app import ed25519, llm
 from app.gateway import Gateway, GatewayError, payment_status
 from app.paypal import PAYMENT_TIMEOUT_TEXT, PAYMENT_UNKNOWN_HINT, PayPalError, PayPalSimulated
-from app.util import b64url
+from app.util import CART_CONTEXT, b64url, canonical_json, sha256_hex
 from tools.verify_evidence import verify_bundle
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -406,6 +406,61 @@ class FlowTest(unittest.TestCase):
                 self.g.start_agent("Book my trip")
         self.assertFalse(self.g.agent_running)
         self.assertTrue(self.g.reset()["ok"])
+
+    def test_E1_edited_cart_does_not_verify(self):
+        self.connect()
+        self.sign_mandate()
+        self.g.request_purchase("R-101", "train")
+        b = json.loads(json.dumps(self.g.evidence(self.carts()["R-101"]["id"])))
+        rec = b["cart_mandate"]["record"]
+        rec["total"]["value"] = "1.00"
+        b["cart_mandate"]["signed_string"] = CART_CONTEXT + canonical_json(rec)
+        self.assertNotEqual(all_pass(verify_bundle(b)), [])
+
+    def test_verifier_ties_cart_and_capture_to_the_ledger(self):
+        decision, capture, paypal = ("Ledger: records the gateway decision for this cart",
+                                     "Ledger: records the PayPal capture", "PayPal: order and capture COMPLETED")
+        self.connect()
+        sc = self.sign_mandate()
+        self.run_agent(sc["agent_prompt"])
+        c = self.carts()
+        self.approve(c["H-301"]["id"])
+        hotel = json.loads(json.dumps(self.g.evidence(c["H-301"]["id"])))
+        train = json.loads(json.dumps(self.g.evidence(c["R-101"]["id"])))
+        # The number of checks is quoted in the docs and the video: 19 with an approval, 14 without.
+        self.assertEqual((len(verify_bundle(hotel)), all_pass(verify_bundle(hotel))), (19, []))
+        self.assertEqual((len(verify_bundle(train)), all_pass(verify_bundle(train))), (14, []))
+        with open(os.path.join(HERE, "fixtures", "chrome_evidence.json"), encoding="utf-8") as f:
+            self.assertEqual(len(verify_bundle(json.load(f))), 19)
+
+        def edit(change):
+            b = copy.deepcopy(train)
+            change(b)
+            b["cart_mandate"]["signed_string"] = CART_CONTEXT + canonical_json(b["cart_mandate"]["record"])
+            return b
+
+        # Nobody signs an auto-approved cart, so only the ledger can show that it was changed.
+        other_item = edit(lambda b: b["cart_mandate"]["record"]["items"][0].update(title="Something else", sku="X-000"))
+        self.assertEqual(all_pass(verify_bundle(other_item)), [decision])
+        cheaper = edit(lambda b: b["cart_mandate"]["record"]["total"].update(value="1.00"))
+        self.assertEqual(all_pass(verify_bundle(cheaper)), [decision, capture])
+        # Changing the ledger to agree with the edited cart breaks the hash chain instead.
+        for e in cheaper["ledger"]["entries"]:
+            if e["kind"] == "CART_DECISION" and e["data"]["cart_id"] == cheaper["cart_id"]:
+                e["data"].update(amount="1.00", cart_hash=sha256_hex(cheaper["cart_mandate"]["signed_string"].encode()))
+        self.assertIn("Ledger: hash chain intact from genesis", all_pass(verify_bundle(cheaper)))
+        # The PayPal order in the bundle must be the one the ledger recorded, and the one read back.
+        self.assertEqual(all_pass(verify_bundle(edit(lambda b: b["paypal"].update(order_id="ANOTHER-ORDER")))),
+                         [capture, paypal])
+        self.assertEqual(all_pass(verify_bundle(edit(lambda b: b["paypal"]["readback"].update(order_id="ANOTHER")))),
+                         [paypal])
+        # The traveler's signature already covers an approved cart; the ledger check agrees with it.
+        signed = copy.deepcopy(hotel)
+        signed["cart_mandate"]["record"]["total"]["value"] = "1.00"
+        signed["cart_mandate"]["signed_string"] = CART_CONTEXT + canonical_json(signed["cart_mandate"]["record"])
+        failed = all_pass(verify_bundle(signed))
+        self.assertIn("Approval: the traveler signed this exact cart, HUMAN_PRESENT", failed)
+        self.assertIn(decision, failed)
 
     def test_chrome_webcrypto_evidence_fixture(self):
         with open(os.path.join(HERE, "fixtures", "chrome_evidence.json"), encoding="utf-8") as f:
