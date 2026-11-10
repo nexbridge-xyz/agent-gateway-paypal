@@ -1,6 +1,9 @@
 """PayPal client details that do not need the network."""
+import http.client
 import io
+import json
 import socket
+import ssl
 import time
 import unittest
 import urllib.error
@@ -98,7 +101,108 @@ class SentTest(unittest.TestCase):
         with mock.patch.object(pp, "_open", return_value={}):  # no access_token in the answer
             with self.assertRaises(PayPalError) as ctx:
                 pp.get_order("O1")
-        self.assertEqual((ctx.exception.name, ctx.exception.sent), ("TOKEN_ERROR", False))
+        self.assertEqual((ctx.exception.name, ctx.exception.sent), ("BAD_RESPONSE", False))
+
+
+class Answer:
+    """Stands in for the response object urlopen returns."""
+
+    def __init__(self, body=b"", error=None):
+        self.body, self.error = body, error
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        if self.error:
+            raise self.error
+        return self.body
+
+
+class CatchAllTest(unittest.TestCase):
+    """Whatever goes wrong in a request leaves _open as a PayPalError. An error after the
+    request was sent must say sent=True: the gateway keeps the budget of such a payment."""
+
+    def call(self, **urlopen):
+        pp = PayPalSandbox("id", "secret", timeout=7)
+        req = urllib.request.Request("https://api-m.sandbox.paypal.com/v2/checkout/orders")
+        with mock.patch("urllib.request.urlopen", **urlopen):
+            try:
+                return pp._open(req)
+            except PayPalError as e:
+                return e
+
+    def test_a_connection_that_breaks_after_sending_is_sent(self):
+        # urlopen raises these itself only after the request is out (while it waits for the answer).
+        for error in (http.client.RemoteDisconnected("Remote end closed connection without response"),
+                      ConnectionResetError(54, "Connection reset by peer"),
+                      http.client.BadStatusLine("garbage"),
+                      ssl.SSLError("record layer failure")):
+            e = self.call(side_effect=error)
+            self.assertEqual((e.name, e.status, e.sent), ("CONNECTION_LOST", 0, True), repr(error))
+        # ... or while the answer is being read.
+        e = self.call(return_value=Answer(error=http.client.IncompleteRead(b'{"id": "5A1')))
+        self.assertEqual((e.name, e.sent), ("CONNECTION_LOST", True))
+
+    def test_an_answer_that_is_not_a_json_object_is_sent(self):
+        for body in (b"<html>502 Bad Gateway</html>", b"[1, 2]", b'"text"', b"\xff\xfe\x00"):
+            e = self.call(return_value=Answer(body))
+            self.assertEqual((e.name, e.status, e.sent), ("BAD_RESPONSE", 0, True), body)
+
+    def test_any_other_error_is_wrapped_and_counts_as_sent(self):
+        # For example http.client refusing a header: its message quotes the header, token included.
+        e = self.call(side_effect=ValueError("Invalid header value b'Bearer A21AAK-the-access-token'"))
+        self.assertEqual((type(e), e.name, e.sent), (PayPalError, "BAD_RESPONSE", True))
+        self.assertIn("ValueError", e.short())
+        self.assertNotIn("the-access-token", e.short())      # only the kind of error is shown
+
+    def test_error_details_in_an_unexpected_shape_do_not_break_the_message(self):
+        for details in ("text", {"issue": "X"}, [1, "two"], 7):
+            body = io.BytesIO(json.dumps({"name": "UNPROCESSABLE_ENTITY", "message": "m", "details": details}).encode())
+            e = self.call(side_effect=urllib.error.HTTPError("https://api-m.sandbox.paypal.com/x", 422, "E", {}, body))
+            self.assertEqual(e.short(), "UNPROCESSABLE_ENTITY: m", details)
+        body = io.BytesIO(b'{"name": "UNPROCESSABLE_ENTITY", "message": "m", "debug_id": "d1",'
+                          b' "details": [{"issue": "INSTRUMENT_DECLINED", "description": "Declined."}]}')
+        e = self.call(side_effect=urllib.error.HTTPError("https://api-m.sandbox.paypal.com/x", 422, "E", {}, body))
+        self.assertEqual(e.short(), "UNPROCESSABLE_ENTITY: m · INSTRUMENT_DECLINED Declined. (debug id d1)")
+
+    def test_good_answers_come_through(self):
+        self.assertEqual(self.call(return_value=Answer(b'{"id": "5A1", "status": "COMPLETED"}')),
+                         {"id": "5A1", "status": "COMPLETED"})
+        self.assertEqual(self.call(return_value=Answer(b"")), {})   # 204 No Content
+
+    def test_connecting_errors_are_still_not_sent(self):
+        e = self.call(side_effect=urllib.error.URLError(ConnectionRefusedError("refused")))
+        self.assertEqual((e.name, e.sent), ("NETWORK_ERROR", False))
+        e = self.call(side_effect=urllib.error.URLError(ssl.SSLError("handshake failure")))
+        self.assertEqual((e.name, e.sent), ("NETWORK_ERROR", False))
+
+    def http_error(self, code, body, read_error=None):
+        fp = io.BytesIO(body)
+        if read_error:
+            fp.read = mock.Mock(side_effect=read_error)
+        return urllib.error.HTTPError("https://api-m.sandbox.paypal.com/x", code, "Error", {}, fp)
+
+    def test_an_error_status_is_kept_whatever_the_body_is(self):
+        e = self.call(side_effect=self.http_error(422, b'["not", "an", "object"]'))
+        self.assertEqual((e.status, e.name, e.sent), (422, "HTTP_422", True))
+        e = self.call(side_effect=self.http_error(502, b"<html>Bad Gateway</html>"))
+        self.assertEqual((e.status, e.name), (502, "HTTP_502"))
+        self.assertIn("Bad Gateway", e.short())
+        e = self.call(side_effect=self.http_error(400, b"", read_error=ConnectionResetError("reset")))
+        self.assertEqual((e.status, e.name), (400, "HTTP_400"))
+
+    def test_a_token_answer_without_a_token_is_a_paypal_error(self):
+        for answer in ({}, {"token_type": "Bearer"}, {"access_token": "t", "expires_in": "soon"}):
+            pp = PayPalSandbox("id", "secret")
+            with mock.patch.object(pp, "_open", return_value=answer):
+                with self.assertRaises(PayPalError) as ctx:
+                    pp.check_credentials()
+            self.assertEqual(ctx.exception.name, "BAD_RESPONSE", answer)
+            self.assertIsNone(pp._token)
 
 
 class SimulatorTest(unittest.TestCase):

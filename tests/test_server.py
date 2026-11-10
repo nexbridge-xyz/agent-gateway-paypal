@@ -232,6 +232,23 @@ class ServerTest(unittest.TestCase):
         self.assertNotIn(b"Server error", body)
         self.assertTrue(g.status()["paypal"]["last_error"].startswith("TIMEOUT"))
 
+    def test_connect_and_return_show_a_lost_answer_on_the_paypal_card(self):
+        g = server.Handler.gateway
+        host = "127.0.0.1:%d" % self.port
+        lost = PayPalError(0, "CONNECTION_LOST", "The connection to PayPal broke before its answer was complete.")
+        with mock.patch.object(g.paypal, "create_setup_token", side_effect=lost):
+            self.assertEqual(self.get("/paypal/connect", host), (302, "/?paypal=error"))
+        self.assertTrue(g.status()["paypal"]["last_error"].startswith("CONNECTION_LOST: "))
+        # Coming back from the approval page, the exchange for a vault token gets an answer that cannot be read.
+        g.state["paypal"].pop(g.paypal.env, None)
+        status, approve = self.get("/paypal/connect", host)
+        unreadable = PayPalError(0, "BAD_RESPONSE", "PayPal's answer could not be read.")
+        with mock.patch.object(g.paypal, "create_payment_token", side_effect=unreadable):
+            back = self.get("/paypal/return?approval_token_id=%s" % approve.split("token=")[1], host)
+        self.assertEqual(back, (302, "/?paypal=error"))
+        self.assertTrue(g.status()["paypal"]["last_error"].startswith("BAD_RESPONSE: "))
+        self.assertEqual(g.status()["paypal"]["status"], "disconnected")
+
 
 class StateFileTest(unittest.TestCase):
     """One state file per PayPal mode. Nothing here touches the real data/ directory."""
@@ -280,6 +297,83 @@ class StateFileTest(unittest.TestCase):
                 wipe.assert_called_once_with(server.state_path(mode))
                 build.assert_not_called()                                              # the server is not started
                 self.assertIn(os.path.join("data", os.path.basename(server.state_path(mode))), out.getvalue())
+
+
+class StartupCheckTest(unittest.TestCase):
+    """The credential check at startup: one line, never a traceback, and the reason on the PayPal card."""
+    KEYS = {"PAYPAL_CLIENT_ID": "id", "PAYPAL_CLIENT_SECRET": "secret"}
+    DROPPED = http.client.RemoteDisconnected("Remote end closed connection without response")
+
+    class Answer:
+        def __init__(self, body):
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return self.body
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_a_failed_check_is_one_line_and_is_shown_on_the_paypal_card(self):
+        g = server.build(argparse.Namespace(demo=False), self.KEYS, self.tmp)
+        for answer, name in (({"side_effect": self.DROPPED}, "CONNECTION_LOST"),
+                             ({"return_value": self.Answer(b"<html>Service Unavailable</html>")}, "BAD_RESPONSE"),
+                             ({"return_value": self.Answer(b'{"scope": "none"}')}, "BAD_RESPONSE")):
+            with mock.patch("urllib.request.urlopen", **answer):
+                line = server.paypal_line(g, demo=False)
+            self.assertTrue(line.startswith("PayPal Sandbox (credential check FAILED: " + name), line)
+            self.assertNotIn("\n", line)
+            self.assertEqual(g.status()["paypal"]["last_error"], server.STARTUP_ERROR + line.split("FAILED: ")[1][:-1])
+        # The next start that reaches PayPal takes the line off the card.
+        with mock.patch("urllib.request.urlopen",
+                        return_value=self.Answer(b'{"access_token": "test-token", "expires_in": 3600}')):
+            self.assertEqual(server.paypal_line(g, demo=False), "PayPal Sandbox (credentials OK)")
+        self.assertIsNone(g.status()["paypal"]["last_error"])
+
+    def test_the_simulator_has_nothing_to_check(self):
+        g = server.build(argparse.Namespace(demo=True), {}, self.tmp)
+        self.assertEqual(server.paypal_line(g, demo=True), "PayPal simulated (--demo)")
+        self.assertEqual(server.paypal_line(g), "PayPal simulated (no PAYPAL_CLIENT_ID / SECRET in .env)")
+        self.assertEqual(os.listdir(self.tmp), [])       # nothing was saved
+
+    def test_startup_prints_no_traceback_when_paypal_cannot_be_read(self):
+        class NoServer:
+            def __init__(self, *args, **kwargs):
+                self.daemon_threads = True
+
+            def serve_forever(self):
+                raise KeyboardInterrupt
+
+            def server_close(self):
+                pass
+
+        out = io.StringIO()
+        with mock.patch.object(server, "DATA_DIR", self.tmp), \
+                mock.patch.object(server, "load_env", return_value=dict(self.KEYS)), \
+                mock.patch.object(server, "ThreadingHTTPServer", NoServer), \
+                mock.patch.object(server.Handler, "gateway", None), \
+                mock.patch.object(server.Handler, "base_url", ""), \
+                mock.patch("urllib.request.urlopen", side_effect=self.DROPPED), \
+                mock.patch("sys.stdout", new=out), mock.patch("sys.stderr", new=out):
+            # State goes to the temporary directory. If it would not, stop before anything is written.
+            self.assertEqual(os.path.dirname(server.state_path("sandbox")), self.tmp)
+            server.main(["--port", "8001"])
+        text = out.getvalue()
+        self.assertIn("PayPal : PayPal Sandbox (credential check FAILED: CONNECTION_LOST", text)
+        self.assertIn("State  : ", text)                 # the banner was printed to its end
+        self.assertNotIn("Traceback", text)
+        self.assertEqual(os.listdir(self.tmp), ["state.json"])
+        with open(os.path.join(self.tmp, "state.json"), encoding="utf-8") as f:
+            self.assertTrue(json.load(f)["paypal"]["sandbox"]["last_error"].startswith(server.STARTUP_ERROR))
 
 
 class EnvFileTest(unittest.TestCase):

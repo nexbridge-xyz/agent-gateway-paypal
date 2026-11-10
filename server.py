@@ -398,6 +398,27 @@ def wipe_state(path: str) -> bool:
     return found
 
 
+STARTUP_ERROR = "The PayPal credential check failed when the server started: "
+
+
+def paypal_line(gateway, demo: bool = False) -> str:
+    """The PayPal line of the startup banner, after checking the sandbox credentials.
+
+    A failed check is one line here and never a traceback. The reason also goes on the
+    PayPal card, so the page says why PayPal will not work, and it is taken off again by
+    the next start whose check succeeds.
+    """
+    if not gateway.paypal.live:
+        return "PayPal simulated" + (" (--demo)" if demo else " (no PAYPAL_CLIENT_ID / SECRET in .env)")
+    try:
+        gateway.paypal.check_credentials()
+    except PayPalError as e:
+        gateway.paypal_error(STARTUP_ERROR + e.short())
+        return "PayPal Sandbox (credential check FAILED: %s)" % e.short()
+    gateway.paypal_clear_error()
+    return "PayPal Sandbox (credentials OK)"
+
+
 def build(args, env: dict, data_dir: str | None = None):
     if paypal_mode(args, env) == "sandbox":
         paypal = PayPalSandbox(env["PAYPAL_CLIENT_ID"], env["PAYPAL_CLIENT_SECRET"], "sandbox")
@@ -436,15 +457,8 @@ def main(argv=None):
     base = env.get("BASE_URL") or env.get("RENDER_EXTERNAL_URL") or ""
     Handler.base_url = base.rstrip("/")
 
-    if gateway.paypal.live:
-        try:
-            gateway.paypal.check_credentials()
-            pp_line = "PayPal Sandbox (credentials OK)"
-        except PayPalError as e:
-            pp_line = "PayPal Sandbox (credential check FAILED: %s)" % e.short()
-    else:
-        pp_line = "PayPal simulated" + (" (--demo)" if args.demo else " (no PAYPAL_CLIENT_ID / SECRET in .env)")
-    shown = Handler.base_url or "http://%s:%d" % ("localhost" if host in ("127.0.0.1", "0.0.0.0") else host, port)
+    pp_line = paypal_line(gateway, args.demo)
+    shown =Handler.base_url or "http://%s:%d" % ("localhost" if host in ("127.0.0.1", "0.0.0.0") else host, port)
     print("")
     print("  Agent Gateway for PayPal  ·  by NexBridge")
     print("  ----------------------------------------")

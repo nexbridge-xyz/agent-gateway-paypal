@@ -37,6 +37,7 @@ RESERVED = ("PENDING_APPROVAL",)
 # PayPal order statuses that mean nothing was captured.
 NOT_CAPTURED = ("CREATED", "SAVED", "APPROVED", "PAYER_ACTION_REQUIRED", "VOIDED")
 UNKNOWN_NOTE = "Do not retry this item. Tell the traveler to check it in PayPal."
+REFUND_NOTE = "The refund of "  # start of the line a refund without a clear answer leaves on the PayPal card
 
 
 def payment_status(order_status, capture_status) -> str:
@@ -260,6 +261,14 @@ class Gateway:
                 conn["status"] = "disconnected"
             self.state["paypal"][self.paypal.env] = conn
             self.save()
+
+    def paypal_clear_error(self, prefix: str = ""):
+        """Take the error line off the PayPal card, if there is one that starts with `prefix`."""
+        with self.lock:
+            conn = self._conn()
+            if conn.get("last_error") and str(conn["last_error"]).startswith(prefix):
+                self.state["paypal"][self.paypal.env] = dict(conn, last_error=None)
+                self.save()
 
     # ------------------------------------------------------------------
     # mandates
@@ -733,7 +742,17 @@ class Gateway:
             res = self.paypal.refund(capture_id, cart["price_minor"], self.currency, "rf_" + cart_id,
                                      "Refund for %s (cancelled by the traveler)." % cart["item"]["title"])
         except PayPalError as e:
+            if e.status == 0:
+                # PayPal gave no answer of its own (no connection, or the answer was lost), so the
+                # PayPal card says what that means for this refund.
+                self.paypal_error(REFUND_NOTE + "%s %s (%s); try again, the refund keeps its request id "
+                                  "and cannot be made twice." % (
+                                      cart["item"]["title"],
+                                      "was not made, because PayPal could not be reached" if e.sent is False else
+                                      "may or may not have gone through, because PayPal's answer was lost",
+                                      e.short()))
             raise GatewayError("PayPal refund failed: " + e.short(), 502)
+        self.paypal_clear_error(REFUND_NOTE)
         with self.lock:
             cart["refund"] = dict(res, at=now_iso())
             if res.get("status") in ("COMPLETED", "PENDING"):

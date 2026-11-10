@@ -14,7 +14,7 @@ from unittest import mock
 import server
 from app import ed25519, llm
 from app.gateway import Gateway, GatewayError, payment_status
-from app.paypal import PAYMENT_TIMEOUT_TEXT, PAYMENT_UNKNOWN_HINT, PayPalError, PayPalSimulated
+from app.paypal import PAYMENT_TIMEOUT_TEXT, PAYMENT_UNKNOWN_HINT, PayPalError, PayPalSandbox, PayPalSimulated
 from app.util import CART_CONTEXT, b64url, b64url_decode, canonical_json, mask_tail, sha256_hex
 from tools.verify_evidence import verify_bundle
 
@@ -438,6 +438,79 @@ class FlowTest(unittest.TestCase):
         g2.reset()
         self.assertEqual(g2.state["secrets"]["fingerprint_key"], key)
         self.assertEqual(g2._vault_fingerprint(vault), fp)
+
+    def test_Q5_real_client_a_lost_answer_keeps_the_budget_and_an_unsent_request_frees_it(self):
+        # The real PayPal client with urlopen replaced: no network, but its own error handling.
+        import http.client
+
+        class Token:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return b'{"access_token": "test-token", "expires_in": 3600}'
+
+        dropped = http.client.RemoteDisconnected("Remote end closed connection without response")
+
+        def order_is_sent_then_the_line_drops(req, timeout=None):
+            if req.full_url.endswith("/v1/oauth2/token"):
+                return Token()
+            raise dropped
+
+        sandbox = PayPalSandbox("id", "secret")
+        self.g = Gateway(sandbox, llm.ScriptedAI(0), os.path.join(self.tmp, "sandbox.json"))
+        self.kid = self.g.register_device(b64url(ed25519.public_key(self.sk)))["key_id"]
+        self.g.state["paypal"]["sandbox"] = {"status": "connected", "vault_id": "vault-for-the-test"}
+        self.sign_mandate()
+        # The order request went out and the answer never came: PayPal may have charged.
+        with mock.patch("urllib.request.urlopen", side_effect=order_is_sent_then_the_line_drops):
+            out = self.g.call_tool("request_purchase", {"sku": "R-101", "reason": "train"})
+        self.assertEqual(out["status"], "PAYMENT_UNKNOWN")
+        self.assertIn("CONNECTION_LOST", out["error"])
+        self.assertTrue(out["error"].endswith(PAYMENT_UNKNOWN_HINT))
+        self.assertEqual(self.g.status()["mandate"]["budget"]["paid"], "98.00")
+        # No access token at all: the order request was never made, so nothing can have been charged.
+        sandbox._token = None
+        with mock.patch("urllib.request.urlopen", side_effect=dropped):
+            out = self.g.call_tool("request_purchase", {"sku": "R-201", "reason": "train"})
+        self.assertEqual(out["status"], "NOT_EXECUTED")
+        self.assertIn("CONNECTION_LOST", out["error"])
+        self.assertEqual(self.g.status()["mandate"]["budget"]["paid"], "98.00")
+        self.assertEqual([e["kind"] for e in self.g.ledger_entries()][-4:],
+                         ["CART_DECISION", "PAYMENT_UNKNOWN", "CART_DECISION", "PAYMENT_FAILED"])
+
+    def test_Q5_refund_without_a_clear_answer_is_explained_on_the_paypal_card(self):
+        self.connect()
+        self.sign_mandate()
+        self.g.request_purchase("R-101", "train")
+        cart_id = self.carts()["R-101"]["id"]
+
+        def refund_fails_with(error):
+            with mock.patch.object(self.g.paypal, "refund", side_effect=error):
+                with self.assertRaises(GatewayError) as ctx:
+                    self.g.refund(cart_id)
+            self.assertEqual(ctx.exception.status, 502)                  # the page shows it as before
+            self.assertEqual(self.carts()["R-101"]["status"], "PAID")    # and the purchase is unchanged
+            return self.g.status()["paypal"]["last_error"]
+
+        # PayPal answered with an error of its own: that is shown as before, and the card stays clean.
+        refused = PayPalError(422, "UNPROCESSABLE_ENTITY", "The capture cannot be refunded.")
+        self.assertIsNone(refund_fails_with(refused))
+        # The answer was lost after the request went out.
+        lost = PayPalError(0, "CONNECTION_LOST", "The connection to PayPal broke before its answer was complete.")
+        note = refund_fails_with(lost)
+        self.assertTrue(note.startswith("The refund of Tokyo → Shin-Osaka bullet train"))
+        self.assertIn("may or may not have gone through", note)
+        self.assertIn("CONNECTION_LOST", note)
+        # PayPal was never reached.
+        note = refund_fails_with(PayPalError(0, "NETWORK_ERROR", "Connection refused", sent=False))
+        self.assertIn("was not made, because PayPal could not be reached", note)
+        # The next refund that works takes the line off the card again.
+        self.assertEqual(self.g.refund(cart_id)["status"], "REFUNDED")
+        self.assertIsNone(self.g.status()["paypal"]["last_error"])
 
     def test_P4_each_paypal_mode_has_its_own_state_file(self):
         data = os.path.join(self.tmp, "data")

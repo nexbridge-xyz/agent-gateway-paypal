@@ -365,11 +365,12 @@ This project follows the shape of the Agent Payments Protocol (AP2): an Intent M
 
 **How PayPal errors are handled:**
 
-- Every PayPal request goes through `PayPalSandbox._open`.
-  - An HTTP error becomes a `PayPalError` with PayPal's `name`, `message`, the first item of `details` and the `debug_id`.
+- Every PayPal request goes through `PayPalSandbox._open`, and every failure leaves it as a `PayPalError`.
+  - An HTTP error becomes a `PayPalError` with PayPal's `name`, `message`, the first item of `details` and the `debug_id`. The HTTP status is kept even when the error body cannot be read.
   - If PayPal cannot be reached, the error is `NETWORK_ERROR`.
   - If PayPal does not answer in time (40 seconds by default), the error is `TIMEOUT`.
-  - `PayPalError.sent` is false when the request never reached PayPal: an error while connecting, or any error while getting the access token.
+  - If the connection breaks after the request was sent, the error is `CONNECTION_LOST`. If the answer is not a JSON object, or anything else goes wrong, it is `BAD_RESPONSE`.
+  - `PayPalError.sent` is false when the request never reached PayPal: an error while connecting, or any error while getting the access token. `CONNECTION_LOST` and `BAD_RESPONSE` count as sent, so a payment that hits them becomes `PAYMENT_UNKNOWN` and never `NOT_EXECUTED`.
 - **Payment refused or not sent:** if PayPal answers with a 4xx error, or the request never left, the cart is marked `NOT_EXECUTED` and its budget is free again. The ledger records `PAYMENT_FAILED` with the `debug_id`. A permission error gets a hint about enabling Vault (`VAULT_HINT`).
 - **Payment result unknown:** after a timeout, a 5xx answer, a dropped connection or an answer that cannot be read, PayPal may have charged. The cart becomes `PAYMENT_UNKNOWN` and keeps its amount in the budget, and the ledger records `PAYMENT_UNKNOWN`. The message says so: "PayPal did not answer in time. The payment may still have gone through, so its amount stays counted in the budget. Check the PayPal sandbox account." (`PAYMENT_TIMEOUT_TEXT`). The result that goes back to the agent says "Do not retry this item".
 - **Which answer counts:** with an order id, the gateway reads the order back and uses the statuses and the capture id from that read-back. If the read-back fails, it uses the first answer. `payment_status` in `app/gateway.py` then decides:
@@ -378,8 +379,9 @@ This project follows the shape of the Agent Payments Protocol (AP2): an Intent M
   - capture `DECLINED` or `FAILED`, or an order that was not captured: `NOT_EXECUTED`;
   - anything else, for example an order PayPal calls `COMPLETED` with no capture: `PAYMENT_UNKNOWN`.
   - A status other than `COMPLETED` is never marked as paid.
-- **Refund error or timeout:** the request returns 502 with PayPal's error, and the cart's status does not change.
-- **Error from PayPal on Connect PayPal** (including a timeout): the message is stored with the connection, the page goes back to `/?paypal=error`, and the PayPal card shows the message.
+- **Refund error or timeout:** the request returns 502 with PayPal's error, and the cart's status does not change. When PayPal gave no answer of its own (no connection, or the answer was lost), the PayPal card also says whether the refund may have gone through. The next refund that works removes that line.
+- **Error from PayPal on Connect PayPal** (including a timeout or a lost answer): the message is stored with the connection, the page goes back to `/?paypal=error`, and the PayPal card shows the message.
+- **Credential check at startup** (`paypal_line` in `server.py`): a failure is one line in the startup banner, never a traceback, and the PayPal card shows the reason. The next start whose check succeeds removes it.
 - **Access token:** the first request after start sends `ignoreCache=true`, so PayPal does not return an older cached token (for example one issued before Vault was enabled). After that, a new token is requested when the current one is within 60 seconds of expiring.
 
 **Common changes:**

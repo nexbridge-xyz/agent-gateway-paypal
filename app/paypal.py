@@ -14,6 +14,7 @@ the gateway keeps the amount in the budget (PAYMENT_UNKNOWN) instead of guessing
 from __future__ import annotations
 
 import base64
+import http.client
 import json
 import secrets
 import socket
@@ -44,7 +45,8 @@ class PayPalError(Exception):
         self.name = name
         self.message = message
         self.debug_id = debug_id
-        self.details = details or []
+        # PayPal sends a list of objects. Anything else is dropped, so short() cannot fail on it.
+        self.details = [d for d in details if isinstance(d, dict)] if isinstance(details, list) else []
         # False when the request never reached PayPal (no connection, no access token),
         # so nothing can have been charged. True means PayPal may have received it.
         self.sent = sent
@@ -88,16 +90,48 @@ class PayPalSandbox:
         self._lock = threading.Lock()
 
     # -- plumbing ---------------------------------------------------------
-    def _open(self, req):
+    def _open(self, req) -> dict:
+        """Send one request and return PayPal's JSON object.
+
+        Every failure leaves as a PayPalError, and its `sent` flag says whether PayPal can have
+        received the request. The gateway relies on that flag: a payment that may have been
+        charged must never be closed as "not executed".
+        """
+        try:
+            return self._send(req)
+        except PayPalError:
+            raise
+        except (http.client.HTTPException, OSError) as e:
+            # urllib turns what goes wrong while it connects or sends into URLError, which _send
+            # reports as not sent. What arrives here broke later, while waiting for the answer
+            # or reading it. The request was sent, so `sent` stays True.
+            raise PayPalError(0, "CONNECTION_LOST", "The connection to PayPal broke before its answer was complete "
+                              "(%s)." % (str(e) or type(e).__name__))
+        except Exception as e:  # noqa: BLE001 - nothing else is expected; treat it as sent to be safe
+            # Only the kind of error is shown: the text of an unknown error could quote a request header.
+            raise PayPalError(0, "BAD_RESPONSE", "The PayPal call failed in an unexpected way (%s)." % type(e).__name__)
+
+    def _send(self, req) -> dict:
         try:
             with urllib.request.urlopen(req, timeout=self._timeout) as resp:
                 raw = resp.read()
-                return json.loads(raw) if raw else {}
+            try:
+                data = json.loads(raw) if raw else {}
+            except ValueError:
+                data = None
+            if not isinstance(data, dict):
+                raise PayPalError(0, "BAD_RESPONSE", "PayPal's answer was not a JSON object.")
+            return data
         except urllib.error.HTTPError as e:
-            raw = e.read() or b""
+            try:
+                raw = e.read() or b""
+            except Exception:  # noqa: BLE001 - the status already says what happened
+                raw = b""
             try:
                 body = json.loads(raw)
             except ValueError:
+                body = None
+            if not isinstance(body, dict):
                 body = {"message": raw[:300].decode("utf-8", "replace")}
             raise PayPalError(e.code, body.get("name") or body.get("error") or "HTTP_%d" % e.code,
                               body.get("message") or body.get("error_description") or "",
@@ -130,8 +164,12 @@ class PayPalSandbox:
                          "Content-Type": "application/x-www-form-urlencoded"},
                 method="POST")
             body = self._open(req)
-            self._token = body["access_token"]
-            self._token_exp = time.time() + int(body.get("expires_in", 3000))
+            try:
+                token = body["access_token"]
+                expires = time.time() + int(body.get("expires_in", 3000))
+            except (KeyError, TypeError, ValueError):
+                raise PayPalError(0, "BAD_RESPONSE", "PayPal's answer had no access token.")
+            self._token, self._token_exp = token, expires
             return self._token
 
     def _call(self, method: str, path: str, body=None, request_id=None) -> dict:
