@@ -16,6 +16,7 @@ import html
 import json
 import mimetypes
 import os
+import re
 import socket
 import sys
 import traceback
@@ -65,6 +66,23 @@ def allowed_hosts(port: int, base_url: str = "") -> set:
     return hosts
 
 
+def env_value(raw: str) -> str:
+    """The value of one KEY=VALUE line of a .env file.
+
+    Inside quotes everything is the value, "#" included. Without quotes, " #" starts a
+    comment ("PORT=8001  # my port"), while a "#" with no space before it stays in the
+    value ("URL=https://example.com/#top").
+    """
+    def quoted(text):
+        return len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'"
+
+    val = raw.strip()
+    if quoted(val):
+        return val[1:-1]
+    val = re.split(r"\s#", raw, maxsplit=1)[0].strip()
+    return val[1:-1] if quoted(val) else val  # "value"  # comment
+
+
 def load_env(path: str) -> dict:
     """Minimal .env reader: KEY=VALUE lines, # comments, optional quotes. Real env vars win."""
     values = {}
@@ -78,10 +96,7 @@ def load_env(path: str) -> dict:
                 key = key.strip()
                 if key.startswith("export "):
                     key = key[7:].strip()
-                val = val.strip()
-                if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
-                    val = val[1:-1]
-                values[key] = val
+                values[key] = env_value(val)
     for key in list(values):
         if os.environ.get(key):
             values[key] = os.environ[key]

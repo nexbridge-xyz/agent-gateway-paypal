@@ -4,6 +4,7 @@ import http.client
 import io
 import json
 import os
+import re
 import shutil
 import socket
 import tempfile
@@ -279,6 +280,56 @@ class StateFileTest(unittest.TestCase):
                 wipe.assert_called_once_with(server.state_path(mode))
                 build.assert_not_called()                                              # the server is not started
                 self.assertIn(os.path.join("data", os.path.basename(server.state_path(mode))), out.getvalue())
+
+
+class EnvFileTest(unittest.TestCase):
+    """The .env reader. Every file here is written to a temporary directory."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def load(self, text, environ=None):
+        path = os.path.join(self.tmp, "sample.env")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        with mock.patch.dict(os.environ, environ or {}, clear=True):
+            return server.load_env(path)
+
+    def test_a_comment_after_a_value_is_dropped(self):
+        env = self.load("PORT=8001   # my port\nHOST=127.0.0.1\t# after a tab\nEMPTY= # nothing set\nBASE_URL=\n")
+        self.assertEqual((env["PORT"], env["HOST"], env["EMPTY"], env["BASE_URL"]), ("8001", "127.0.0.1", "", ""))
+        self.assertEqual(int(env["PORT"]), 8001)    # this used to stop the server at startup
+
+    def test_a_hash_with_no_space_before_it_stays(self):
+        env = self.load("URL=https://example.com/#top\nCOLOR=#ff0000\nTOKEN=abc#def # a comment\n")
+        self.assertEqual((env["URL"], env["COLOR"], env["TOKEN"]), ("https://example.com/#top", "#ff0000", "abc#def"))
+
+    def test_quotes_keep_everything_inside(self):
+        env = self.load('A="x # y"\nB=\'p # q\'\nC="quoted"   # then a comment\nD=  "spaces around"  \n')
+        self.assertEqual((env["A"], env["B"], env["C"], env["D"]), ("x # y", "p # q", "quoted", "spaces around"))
+
+    def test_other_lines_work_as_before(self):
+        env = self.load("# a comment line\n\nexport NAME=value\nno equals sign here\n  INDENTED = padded  \n",
+                        {"NAME": "from the real environment", "ONLY_REAL": "1"})
+        self.assertEqual(env["NAME"], "from the real environment")     # real environment variables win
+        self.assertEqual((env["INDENTED"], env["ONLY_REAL"]), ("padded", "1"))
+        self.assertNotIn("no equals sign here", env)
+        self.assertEqual(server.load_env(os.path.join(self.tmp, "missing.env")).get("NAME"), os.environ.get("NAME"))
+
+    def test_every_example_line_works_when_its_hash_is_removed(self):
+        # .env.example is the template people copy. A commented example such as
+        # "# OPENAI_BASE_URL=..." must give a usable value once the leading "#" is taken away.
+        with open(os.path.join(server.ROOT, ".env.example"), encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        examples = [m.groups() for m in (re.match(r"^#\s*([A-Z][A-Z0-9_]*)=(.+)$", line) for line in lines) if m]
+        self.assertIn("OPENAI_BASE_URL", [key for key, _ in examples])
+        for key, raw in examples:
+            self.assertNotRegex(server.env_value(raw), r"\s", "%s would get a value with a space in it" % key)
+        self.assertEqual(server.env_value(dict(examples)["OPENAI_BASE_URL"]), "https://api.openai.com/v1")
+        self.assertTrue(any("DeepSeek" in line and "https://api.deepseek.com/v1" in line for line in lines))
 
 
 if __name__ == "__main__":
