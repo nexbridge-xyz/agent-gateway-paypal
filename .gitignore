@@ -1,0 +1,8 @@
+# Secrets and local state
+.env
+data/
+
+# Python and macOS
+__pycache__/
+*.pyc
+.DS_Store

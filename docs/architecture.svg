@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 470" width="960" height="470" font-family="ui-sans-serif, -apple-system, Segoe UI, Roboto, sans-serif">
+  <title>Agent Gateway architecture</title>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8e97a5"/>
+    </marker>
+  </defs>
+  <rect width="960" height="470" rx="16" fill="#0a0c0f"/>
+
+  <!-- Traveler device -->
+  <rect x="30" y="40" width="230" height="150" rx="12" fill="#111419" stroke="#3ef2a0" stroke-width="1.5"/>
+  <text x="48" y="70" fill="#e7e9ec" font-size="16" font-weight="600">Traveler's device</text>
+  <text x="48" y="96" fill="#8e97a5" font-size="13">Ed25519 key (WebCrypto,</text>
+  <text x="48" y="114" fill="#8e97a5" font-size="13">non-extractable, IndexedDB)</text>
+  <text x="48" y="142" fill="#3ef2a0" font-size="13">Signs Intent Mandate</text>
+  <text x="48" y="162" fill="#f5b544" font-size="13">Signs Cart Mandate above limit</text>
+
+  <!-- AI agent -->
+  <rect x="30" y="250" width="230" height="170" rx="12" fill="#111419" stroke="#242a33"/>
+  <text x="48" y="280" fill="#e7e9ec" font-size="16" font-weight="600">AI travel agent</text>
+  <text x="48" y="304" fill="#8e97a5" font-size="13">Claude / OpenAI-compatible /</text>
+  <text x="48" y="322" fill="#8e97a5" font-size="13">scripted (no key)</text>
+  <text x="48" y="352" fill="#e7e9ec" font-size="12.5" font-family="ui-monospace, Menlo, monospace">get_mandate()</text>
+  <text x="48" y="372" fill="#e7e9ec" font-size="12.5" font-family="ui-monospace, Menlo, monospace">search_inventory()</text>
+  <text x="48" y="392" fill="#e7e9ec" font-size="12.5" font-family="ui-monospace, Menlo, monospace">request_purchase(sku)</text>
+  <text x="48" y="410" fill="#ff6363" font-size="11.5">never sees payment details</text>
+
+  <!-- Gateway -->
+  <rect x="345" y="40" width="270" height="380" rx="12" fill="#111419" stroke="#e7e9ec" stroke-width="1.5"/>
+  <text x="363" y="70" fill="#e7e9ec" font-size="16" font-weight="600">Agent Gateway</text>
+  <text x="363" y="92" fill="#8e97a5" font-size="13">plain code, never the model</text>
+  <text x="363" y="124" fill="#e7e9ec" font-size="13">Verify signatures (Ed25519)</text>
+  <text x="363" y="148" fill="#e7e9ec" font-size="13">Price from catalog, fixed payee</text>
+  <text x="363" y="176" fill="#8e97a5" font-size="12.5">Hard checks → DENIED</text>
+  <text x="375" y="196" fill="#8e97a5" font-size="12">active · dates · category · merchant</text>
+  <text x="375" y="214" fill="#8e97a5" font-size="12">budget · purchase count</text>
+  <text x="363" y="240" fill="#8e97a5" font-size="12.5">Soft checks → NEEDS_APPROVAL</text>
+  <text x="375" y="260" fill="#8e97a5" font-size="12">auto-approve limit · repeat</text>
+  <text x="363" y="286" fill="#8e97a5" font-size="12.5">Re-check on approval · holds vault token</text>
+  <rect x="363" y="306" width="234" height="96" rx="8" fill="#0a0c0f" stroke="#242a33"/>
+  <text x="377" y="330" fill="#e7e9ec" font-size="13" font-weight="600">Hash-chained ledger</text>
+  <text x="377" y="352" fill="#8e97a5" font-size="12">entry.hash = SHA-256(entry)</text>
+  <text x="377" y="370" fill="#8e97a5" font-size="12">entry.prev = previous hash</text>
+  <text x="377" y="390" fill="#8e97a5" font-size="12">PayPal ids, never secrets</text>
+
+  <!-- PayPal -->
+  <rect x="700" y="40" width="230" height="230" rx="12" fill="#111419" stroke="#5aa2ff" stroke-width="1.5"/>
+  <text x="718" y="70" fill="#5aa2ff" font-size="16" font-weight="600">PayPal (sandbox)</text>
+  <text x="718" y="100" fill="#e7e9ec" font-size="12" font-family="ui-monospace, Menlo, monospace">/v3/vault/setup-tokens</text>
+  <text x="718" y="120" fill="#e7e9ec" font-size="12" font-family="ui-monospace, Menlo, monospace">/v3/vault/payment-tokens</text>
+  <text x="718" y="150" fill="#e7e9ec" font-size="12" font-family="ui-monospace, Menlo, monospace">/v2/checkout/orders</text>
+  <text x="732" y="168" fill="#8e97a5" font-size="11.5">vault_id, payer not present</text>
+  <text x="718" y="196" fill="#e7e9ec" font-size="12" font-family="ui-monospace, Menlo, monospace">GET order (read back)</text>
+  <text x="718" y="224" fill="#e7e9ec" font-size="12" font-family="ui-monospace, Menlo, monospace">/v2/payments/captures/</text>
+  <text x="732" y="242" fill="#e7e9ec" font-size="12" font-family="ui-monospace, Menlo, monospace">{id}/refund</text>
+
+  <!-- Evidence -->
+  <rect x="700" y="300" width="230" height="120" rx="12" fill="#111419" stroke="#242a33"/>
+  <text x="718" y="330" fill="#e7e9ec" font-size="16" font-weight="600">Evidence bundle</text>
+  <text x="718" y="354" fill="#8e97a5" font-size="12.5">mandate + cart + signatures</text>
+  <text x="718" y="372" fill="#8e97a5" font-size="12.5">+ checks + PayPal ids + ledger</text>
+  <text x="718" y="400" fill="#3ef2a0" font-size="12" font-family="ui-monospace, Menlo, monospace">tools/verify_evidence.py</text>
+
+  <!-- arrows -->
+  <path d="M260 115 H340" stroke="#8e97a5" stroke-width="1.5" fill="none" marker-end="url(#a)"/>
+  <text x="270" y="106" fill="#8e97a5" font-size="11">signatures</text>
+  <path d="M260 335 H340" stroke="#8e97a5" stroke-width="1.5" fill="none" marker-end="url(#a)" marker-start="url(#a)"/>
+  <text x="272" y="326" fill="#8e97a5" font-size="11">3 tools</text>
+  <path d="M615 140 H695" stroke="#5aa2ff" stroke-width="1.5" fill="none" marker-end="url(#a)"/>
+  <text x="628" y="131" fill="#5aa2ff" font-size="11">only if allowed</text>
+  <path d="M615 360 H695" stroke="#8e97a5" stroke-width="1.5" fill="none" marker-end="url(#a)"/>
+  <text x="630" y="351" fill="#8e97a5" font-size="11">export</text>
+</svg>

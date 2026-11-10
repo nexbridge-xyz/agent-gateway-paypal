@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""Verify an Agent Gateway evidence bundle offline.
+
+    python3 tools/verify_evidence.py evidence.json
+
+Checks, with no network and no trust in the gateway:
+  1. The Intent Mandate signature (Ed25519) verifies, and the signed string is
+     exactly CONTEXT + canonical JSON of the mandate record.
+  2. The key id is the SHA-256 prefix of the public key, and it is the mandate's principal.
+  3. The Cart Mandate string matches its record and points to this Intent Mandate (id and hash).
+  4. If the traveler approved (human present): that signature verifies, it was made by the
+     same device key, and the approved cart is the same cart.
+  5. The purchase fits the signed constraints (category, budget, auto-approve limit or approval).
+  6. The ledger hash chain is intact from genesis to the head, and it records the mandate,
+     the decision and the PayPal capture for this cart.
+Exit code 0 when every check passes, 1 otherwise. Python 3.9+ standard library only.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
+from app import ed25519  # noqa: E402
+from app.ledger import GENESIS, verify_entries  # noqa: E402
+from app.util import CART_CONTEXT, INTENT_CONTEXT, b64url_decode, canonical_json, to_minor  # noqa: E402
+
+
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def verify_bundle(bundle: dict) -> list:
+    """Return a list of (ok, label, detail)."""
+    results = []
+
+    def check(ok, label, detail=""):
+        results.append((bool(ok), label, detail))
+        return bool(ok)
+
+    im = bundle.get("intent_mandate") or {}
+    rec = im.get("record") or {}
+    try:
+        pub = b64url_decode(im.get("public_key") or "")
+        sig = b64url_decode(im.get("signature") or "")
+    except (ValueError, TypeError):
+        pub, sig = b"", b""
+    check(im.get("signed_string") == INTENT_CONTEXT + canonical_json(rec),
+          "Intent Mandate: signed string matches the record")
+    check(ed25519.verify(pub, (im.get("signed_string") or "").encode("utf-8"), sig),
+          "Intent Mandate: Ed25519 signature verifies", "key %s" % im.get("key_id"))
+    kid = hashlib.sha256(pub).hexdigest()[:16]
+    check(kid == im.get("key_id") == (rec.get("principal") or {}).get("device_key_id"),
+          "Intent Mandate: key id = SHA-256(public key) and is the principal", kid)
+
+    cm = bundle.get("cart_mandate") or {}
+    crec = cm.get("record") or {}
+    check(cm.get("signed_string") == CART_CONTEXT + canonical_json(crec), "Cart Mandate: string matches the record")
+    check(crec.get("intent_mandate_id") == rec.get("id") and
+          crec.get("intent_mandate_hash") == _sha(im.get("signed_string") or ""),
+          "Cart Mandate: points to this Intent Mandate (id and hash)", str(rec.get("id")))
+
+    approval = bundle.get("cart_approval")
+    c = rec.get("constraints") or {}
+    cur = c.get("currency", "USD")
+    total = to_minor((crec.get("total") or {}).get("value") or 0, cur)
+    if approval:
+        arec = approval.get("record") or {}
+        try:
+            apub = b64url_decode(approval.get("public_key") or "")
+            asig = b64url_decode(approval.get("signature") or "")
+        except (ValueError, TypeError):
+            apub, asig = b"", b""
+        check(approval.get("signed_string") == CART_CONTEXT + canonical_json(arec),
+              "Approval: signed string matches the record")
+        check(ed25519.verify(apub, (approval.get("signed_string") or "").encode("utf-8"), asig),
+              "Approval: Ed25519 signature verifies (human present)")
+        check(apub == pub and arec.get("approver_key_id") == im.get("key_id"),
+              "Approval: signed by the same device that signed the mandate")
+        skip = ("presence", "approved_at", "approver_key_id")
+        same = {k: v for k, v in arec.items() if k not in skip} == {k: v for k, v in crec.items() if k not in skip}
+        check(same and arec.get("presence") == "HUMAN_PRESENT",
+              "Approval: the traveler signed this exact cart, HUMAN_PRESENT")
+
+    items = crec.get("items") or []
+    cats = set(c.get("allowed_categories") or [])
+    check(items and all(i.get("category") in cats for i in items), "Constraints: category allowed",
+          ", ".join(i.get("category", "?") for i in items))
+    check(total <= to_minor(c.get("total_budget") or 0, cur), "Constraints: amount within total budget",
+          "%s %s" % ((crec.get("total") or {}).get("value"), cur))
+    under = total <= to_minor(c.get("auto_approve_limit") or 0, cur)
+    check(under or approval, "Constraints: under the auto-approve limit, or approved by the traveler",
+          "auto-approved" if under else "human approval")
+
+    led = bundle.get("ledger") or {}
+    entries = led.get("entries") or []
+    v = verify_entries(entries)
+    check(v.get("ok"), "Ledger: hash chain intact from genesis", "%d entries" % len(entries) if v.get("ok") else
+          "broken at #%s: %s" % (v.get("broken_at"), v.get("why")))
+    check((entries[-1]["hash"] if entries else GENESIS) == led.get("head"), "Ledger: head hash matches",
+          str(led.get("head"))[:16])
+    cart_id = bundle.get("cart_id")
+    kinds = [(e.get("kind"), e.get("data") or {}) for e in entries]
+    check(any(k == "MANDATE_SIGNED" and d.get("mandate_id") == rec.get("id") and
+              d.get("signed_hash") == _sha(im.get("signed_string") or "") for k, d in kinds),
+          "Ledger: records this signed mandate")
+    check(any(k == "CART_DECISION" and d.get("cart_id") == cart_id for k, d in kinds),
+          "Ledger: records the gateway decision for this cart")
+    pp = bundle.get("paypal") or {}
+    if pp.get("capture_id"):
+        check(any(k == "PAYPAL_CAPTURE" and d.get("cart_id") == cart_id and d.get("capture_id") == pp["capture_id"]
+                  for k, d in kinds),
+              "Ledger: records the PayPal capture", "%s / capture %s" % (pp.get("order_id"), pp.get("capture_id")))
+        check(pp.get("order_status") == "COMPLETED" and pp.get("capture_status") == "COMPLETED",
+              "PayPal: order and capture COMPLETED", "%s (%s)" % (pp.get("order_status"), pp.get("env")))
+    if approval:
+        check(any(k == "CART_SIGNED" and d.get("cart_id") == cart_id and
+                  d.get("signed_hash") == _sha(approval.get("signed_string") or "") for k, d in kinds),
+              "Ledger: records the traveler's approval signature")
+    return results
+
+
+def main(argv=None):
+    argv = argv if argv is not None else sys.argv[1:]
+    if len(argv) != 1:
+        print(__doc__.strip().splitlines()[0])
+        print("usage: python3 tools/verify_evidence.py evidence.json")
+        return 2
+    with open(argv[0], "r", encoding="utf-8") as f:
+        bundle = json.load(f)
+    results = verify_bundle(bundle)
+    crec = (bundle.get("cart_mandate") or {}).get("record") or {}
+    item = (crec.get("items") or [{}])[0]
+    print("Evidence bundle %s" % bundle.get("cart_id"))
+    print("  %s · %s %s · status %s" % (item.get("title"), (crec.get("total") or {}).get("value"),
+                                         (crec.get("total") or {}).get("currency"), bundle.get("status")))
+    print("")
+    for ok, label, detail in results:
+        print("  %s %s%s" % ("PASS" if ok else "FAIL", label, ("  (%s)" % detail) if detail else ""))
+    passed = sum(1 for r in results if r[0])
+    print("")
+    all_ok = passed == len(results)
+    print("  %s: %d of %d checks passed" % ("VERIFIED" if all_ok else "NOT VERIFIED", passed, len(results)))
+    return 0 if all_ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
