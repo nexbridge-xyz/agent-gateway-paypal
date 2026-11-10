@@ -256,6 +256,8 @@ Auto-approved carts are not signed by anyone. Their authority is the Intent Mand
 - if the cart was paid: the ledger records the capture with the same order id, capture id and amount, the order read back is the same order, and PayPal reported the order and capture as `COMPLETED`;
 - if there is an approval: the ledger records the approval signature.
 
+The verifier treats a bundle as input from someone else. Text from the bundle is printed with control characters shown as escapes (`show`), so a title cannot redraw the terminal or forge a result line. A file that is not built like a bundle gives `NOT VERIFIED` with the reason, not a traceback. The exit code is 0 only when every check passes.
+
 ## 5. Checks
 
 `policy.evaluate` runs every check, always in this order, and returns all of them so the UI can show each result.

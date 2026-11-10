@@ -17,6 +17,8 @@ Checks, with no network, that the bundle agrees with itself:
 What it cannot show: that the public key belongs to the traveler, that PayPal really moved
 the money (the PayPal part is what the gateway recorded), or that the holder of the ledger
 did not rebuild it or cut entries off its end. Those need information from outside the bundle.
+A bundle comes from someone else. Text from it is printed with control characters shown as
+escapes, and a file that is not built like a bundle gives NOT VERIFIED with the reason.
 Exit code 0 when every check passes, 1 otherwise. Python 3.9+ standard library only.
 """
 from __future__ import annotations
@@ -25,6 +27,7 @@ import hashlib
 import json
 import os
 import sys
+import unicodedata
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
@@ -41,14 +44,64 @@ def _same_amount(value, total: int, currency: str) -> bool:
     return value is not None and to_minor(value, currency) == total
 
 
-def verify_bundle(bundle: dict) -> list:
-    """Return a list of (ok, label, detail)."""
+STRUCTURE = "Bundle: built as expected"
+PARTS = ("intent_mandate", "cart_mandate", "cart_approval", "paypal", "ledger")
+# Control, formatting (bidi, zero-width), surrogate and line-separator characters.
+UNSAFE = ("Cc", "Cf", "Cs", "Zl", "Zp")
+
+
+def show(value, limit: int = 200) -> str:
+    """Text from a bundle, made safe to print.
+
+    Escape sequences, carriage returns and bidi marks in a title or an id could redraw the
+    terminal: a forged "VERIFIED" line, or hidden text. They are printed as escapes such as
+    \\x1b, and a long value is cut.
+    """
+    text = str(value)
+    if len(text) > limit:
+        text = text[:limit] + "…"
+    return "".join(ch.encode("unicode_escape").decode("ascii") if unicodedata.category(ch) in UNSAFE else ch
+                   for ch in text)
+
+
+def shape_problem(bundle) -> str:
+    """Why a bundle cannot be checked at all. Empty when its outline is as expected."""
+    if not isinstance(bundle, dict):
+        return "the file does not hold a JSON object"
+    for part in PARTS:
+        if bundle.get(part) is not None and not isinstance(bundle[part], dict):
+            return "%s is not an object" % part
+    entries = (bundle.get("ledger") or {}).get("entries")
+    if entries is not None and not (isinstance(entries, list) and all(isinstance(e, dict) for e in entries)):
+        return "ledger.entries is not a list of objects"
+    return ""
+
+
+def verify_bundle(bundle) -> list:
+    """Return a list of (ok, label, detail), one per check.
+
+    It never raises. A bundle that is not built as expected gives one failed result that
+    says what is wrong, so the answer is "not verified" and not a traceback.
+    """
+    problem = shape_problem(bundle)
+    at = ["the bundle"]
+    if not problem:
+        try:
+            return _checks(bundle, at)
+        except Exception as e:  # noqa: BLE001 - whatever is wrong with the input, it is not verified
+            problem = "%s is not built as expected (%s: %s)" % (at[0], type(e).__name__, e)
+    return [(False, STRUCTURE, show(problem))]
+
+
+def _checks(bundle: dict, at: list) -> list:
+    """The checks. `at` names the part being read, for the message when it cannot be read."""
     results = []
 
     def check(ok, label, detail=""):
-        results.append((bool(ok), label, detail))
+        results.append((bool(ok), label, show(detail) if detail else ""))
         return bool(ok)
 
+    at[0] = "intent_mandate"
     im = bundle.get("intent_mandate") or {}
     rec = im.get("record") or {}
     try:
@@ -64,6 +117,7 @@ def verify_bundle(bundle: dict) -> list:
     check(kid == im.get("key_id") == (rec.get("principal") or {}).get("device_key_id"),
           "Intent Mandate: key id = SHA-256(public key) and is the principal", kid)
 
+    at[0] = "cart_mandate"
     cm = bundle.get("cart_mandate") or {}
     crec = cm.get("record") or {}
     check(cm.get("signed_string") == CART_CONTEXT + canonical_json(crec), "Cart Mandate: string matches the record")
@@ -76,6 +130,7 @@ def verify_bundle(bundle: dict) -> list:
     cur = c.get("currency", "USD")
     total = to_minor((crec.get("total") or {}).get("value") or 0, cur)
     if approval:
+        at[0] = "cart_approval"
         arec = approval.get("record") or {}
         try:
             apub = b64url_decode(approval.get("public_key") or "")
@@ -93,6 +148,7 @@ def verify_bundle(bundle: dict) -> list:
         check(same and arec.get("presence") == "HUMAN_PRESENT",
               "Approval: the traveler signed this exact cart, HUMAN_PRESENT")
 
+    at[0] = "the constraints or the cart's items"
     items = crec.get("items") or []
     cats = set(c.get("allowed_categories") or [])
     check(items and all(i.get("category") in cats for i in items), "Constraints: category allowed",
@@ -103,6 +159,7 @@ def verify_bundle(bundle: dict) -> list:
     check(under or approval, "Constraints: under the auto-approve limit, or approved by the traveler",
           "auto-approved" if under else "human approval")
 
+    at[0] = "ledger"
     led = bundle.get("ledger") or {}
     entries = led.get("entries") or []
     v = verify_entries(entries)
@@ -123,6 +180,7 @@ def verify_bundle(bundle: dict) -> list:
     check(decided, "Ledger: records the gateway decision for this cart",
           "" if decided else "no decision entry for this cart" if not decisions else
           "the cart in the bundle is not the cart that was decided on: hash or amount differs")
+    at[0] = "paypal"
     pp = bundle.get("paypal") or {}
     if pp.get("capture_id"):
         check(any(k == "PAYPAL_CAPTURE" and d.get("cart_id") == cart_id and d.get("capture_id") == pp["capture_id"]
@@ -146,14 +204,23 @@ def main(argv=None):
         print(__doc__.strip().splitlines()[0])
         print("usage: python3 tools/verify_evidence.py evidence.json")
         return 2
-    with open(argv[0], "r", encoding="utf-8") as f:
-        bundle = json.load(f)
+    try:
+        with open(argv[0], "r", encoding="utf-8") as f:
+            bundle = json.load(f)
+    except (OSError, ValueError, RecursionError) as e:
+        print("NOT VERIFIED: %s cannot be read as JSON (%s)" % (show(argv[0]), show(e)))
+        return 1
     results = verify_bundle(bundle)
+    if [label for _, label, _ in results] == [STRUCTURE]:
+        print("Evidence bundle %s" % show(bundle.get("cart_id") if isinstance(bundle, dict) else None))
+        print("  NOT VERIFIED: %s" % results[0][2])
+        return 1
     crec = (bundle.get("cart_mandate") or {}).get("record") or {}
     item = (crec.get("items") or [{}])[0]
-    print("Evidence bundle %s" % bundle.get("cart_id"))
-    print("  %s · %s %s · status %s" % (item.get("title"), (crec.get("total") or {}).get("value"),
-                                         (crec.get("total") or {}).get("currency"), bundle.get("status")))
+    total = crec.get("total") or {}
+    print("Evidence bundle %s" % show(bundle.get("cart_id")))
+    print("  %s · %s %s · status %s" % (show(item.get("title")), show(total.get("value")),
+                                         show(total.get("currency")), show(bundle.get("status"))))
     print("")
     for ok, label, detail in results:
         print("  %s %s%s" % ("PASS" if ok else "FAIL", label, ("  (%s)" % detail) if detail else ""))
