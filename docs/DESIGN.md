@@ -298,6 +298,7 @@ The HTTP server also sends `X-Content-Type-Options: nosniff`, a Content Security
 - **A compromised server.** The server holds the vault token and builds the strings the traveler signs. The signing dialog shows a summary built from the record the server returns, and the exact string behind a toggle. A compromised server could also pay without any signature.
 - **A compromised traveler device or browser.** Whoever controls the browser can sign with the device key.
 - **A compromised PayPal account or PayPal app credentials.**
+- **Wrong purchases inside the limits.** A model fooled by merchant text can still buy the wrong thing inside the signed limits, for example a second seat on the same train. The checks cap what it can spend, not what it picks.
 
 **Where secrets live:**
 

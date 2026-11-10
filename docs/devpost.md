@@ -27,7 +27,7 @@ Agent Gateway sits between an AI agent and PayPal.
 - **The agent books.** In the demo, a travel agent books a Tokyo → Osaka trip. It can only search and *ask* to buy. The gateway checks every request in plain code against the signed mandate: active, dates, category, verified merchant, budget, purchase count, auto-approve limit, repeat purchase.
 - **Inside the limits, it pays.** Two $98.00 bullet train tickets are paid through PayPal with the vault token, payer not present.
 - **Above the limit, it asks.** The $236.00 hotel waits until the traveler signs a Cart Mandate. The gateway re-runs the hard checks, then pays.
-- **Outside the limits, it refuses.** One listing hides a prompt injection telling AI agents to book a $1,280.00 suite without asking. Even when the agent obeys it, the gateway denies the payment: merchant not verified, over budget. Even if the AI is fooled, the money isn't. In our live runs, Claude skipped this listing on its own and explained why. The gateway is for the times a model doesn't.
+- **Outside the limits, it refuses.** One listing hides a prompt injection telling AI agents to book a $1,280.00 suite without asking. Even when the agent obeys it, the gateway denies the payment: merchant not verified, over budget. Even if the AI is fooled, it can't spend outside the limits you signed. In our live runs, Claude skipped this listing on its own and explained why. The gateway is for the times a model doesn't.
 - **Proof.** Every purchase has an evidence bundle (signed mandate, signed cart, gateway checks, PayPal order and capture IDs, the order read back from PayPal, and a hash-chained ledger) that `tools/verify_evidence.py` verifies offline.
 - **Kill switch.** Refund through PayPal (the budget comes back) or revoke the mandate (everything after is denied).
 
@@ -71,12 +71,12 @@ python, javascript, html, css, paypal-rest-api, paypal-vault, paypal-orders-v2, 
 
 ## Try it out
 
-- GitHub: <repo URL>
-- (Optional) hosted demo: <URL>
+- GitHub: https://github.com/nexbridge-xyz/agent-gateway-paypal
+- (Optional) hosted demo: https://github.com/nexbridge-xyz/agent-gateway-paypal (no hosted instance; run it locally with `python3 server.py --demo`)
 
 ## Testing instructions
 
-1. `git clone <repo URL> && cd agent-gateway-paypal`
+1. `git clone https://github.com/nexbridge-xyz/agent-gateway-paypal && cd agent-gateway-paypal`
 2. `python3 server.py --demo` (Python 3.9+, no install, no keys)
 3. Open http://localhost:8000 in a current Chrome, Edge, Safari or Firefox and follow the 7 steps in the README "Quick start".
 4. Optional live mode: create a free PayPal sandbox app with Vault enabled (README "Live mode") and put its Client ID and Secret in `.env`. Optional AI: add `ANTHROPIC_API_KEY`.

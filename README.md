@@ -40,14 +40,14 @@ Merchants have the mirror problem: when an agent buys something, who authorised 
    Any hard fail → **DENIED**. Only soft fails → **waits for the traveler**, who signs a **Cart Mandate** (human present). The gateway runs the hard checks again before paying. All pass → the gateway creates a PayPal order with the vault token, payer not present.
 5. **Evidence.** Each purchase gets an evidence bundle: the signed Intent Mandate, the Cart Mandate (and the traveler's signature, if any), the gateway's checks, the PayPal order and capture IDs with the order read back from PayPal, any refund, and the hash-chained ledger up to that purchase. `tools/verify_evidence.py` checks it offline.
 
-**Even if the AI is fooled, the money isn't.** The demo catalog has a listing (H-399) whose text tells AI agents to book a $1,280 suite without asking. "Simulate hijacked agent" sends exactly that request through the same gateway: it is denied (merchant not verified, over budget). In our live runs, Claude skipped this listing on its own and explained why. The gateway is for the times a model doesn't.
+**Even if the AI is fooled, it can't spend outside the limits you signed.** The demo catalog has a listing (H-399) whose text tells AI agents to book a $1,280 suite without asking. "Simulate hijacked agent" sends exactly that request through the same gateway: it is denied (merchant not verified, over budget). In our live runs, Claude skipped this listing on its own and explained why. The gateway is for the times a model doesn't.
 
 ## Quick start (demo mode, no keys)
 
 Python 3.9 or newer, standard library only. No `pip install`.
 
 ```bash
-git clone <this repo>
+git clone https://github.com/nexbridge-xyz/agent-gateway-paypal
 cd agent-gateway-paypal
 python3 server.py --demo
 ```
@@ -120,10 +120,11 @@ PayPal has announced support for Google's Agent Payments Protocol (AP2). This pr
 ## Security model
 
 - **Signatures:** the server builds the exact string to sign (`context + canonical JSON`); the browser shows it and signs those bytes; the server verifies with Ed25519. A different context string for each record type means a signature for one kind of record cannot be replayed as another.
-- **The model never decides payment.** Prices come from the catalog, the payee is fixed, and the checks are plain code. Merchant listing text is labelled untrusted for the model, but safety does not depend on the model obeying that.
+- **The model never decides payment.** Prices come from the catalog, the payee is fixed, and the checks are plain code. Merchant listing text is labelled untrusted for the model, but safety does not depend on the model obeying that. Inside the limits you signed, a fooled model can still buy the wrong thing: the gateway caps what it can spend, not what it picks.
 - **Secrets:** only in `.env` (gitignored). The vault token is stored in `data/state.json` (gitignored, file mode 600) and never sent to the agent, the browser (masked only) or the logs.
 - **HTTP:** POSTs with a foreign `Origin` are refused, request bodies are limited, static paths cannot leave `static/`, `nosniff`, a strict CSP (self + Google Fonts), and `Cache-Control: no-store` on API responses. The server binds to `127.0.0.1` by default.
 - **Ledger:** each entry stores the SHA-256 of the previous one; editing or deleting any entry breaks verification from that point.
+- **No login, so do not host it with real keys.** Anyone who can reach the server can use everything on it: the saved PayPal connection, the mandate, the ledger and your AI key. Run it on your own machine. For a hosted demo, run `python3 server.py --demo` only, and never put real PayPal or AI keys on a public server.
 - This is a hackathon project on the PayPal sandbox, not a production payment service.
 
 ## Project layout
