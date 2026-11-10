@@ -512,6 +512,37 @@ class FlowTest(unittest.TestCase):
         self.assertEqual(self.g.refund(cart_id)["status"], "REFUNDED")
         self.assertIsNone(self.g.status()["paypal"]["last_error"])
 
+    def test_a_successful_startup_check_leaves_the_refund_line_on_the_paypal_card(self):
+        self.connect()
+        self.sign_mandate()
+        self.g.request_purchase("R-101", "train")
+        cart_id = self.carts()["R-101"]["id"]
+        lost = PayPalError(0, "CONNECTION_LOST", "The connection to PayPal broke before its answer was complete.")
+        with mock.patch.object(self.g.paypal, "refund", side_effect=lost):
+            with self.assertRaises(GatewayError):
+                self.g.refund(cart_id)
+        note = self.g.status()["paypal"]["last_error"]
+        self.assertIn("may or may not have gone through", note)
+
+        def start_with_a_check_that_succeeds():
+            # The simulator's own check always succeeds; "live" makes paypal_line() run it.
+            with mock.patch.object(self.g.paypal, "live", True):
+                self.assertEqual(server.paypal_line(self.g), "PayPal Sandbox (credentials OK)")
+            return self.g.status()["paypal"]["last_error"]
+
+        # The server starts again and PayPal answers. The line is about a refund that may or may
+        # not have happened, not about the credential check, so it has to stay on the card.
+        self.assertEqual(start_with_a_check_that_succeeds(), note)
+        # A line the check wrote itself is taken off by the next check that succeeds.
+        self.g.paypal_error(server.STARTUP_ERROR + "CONNECTION_LOST: The connection to PayPal broke.")
+        self.assertIsNone(start_with_a_check_that_succeeds())
+        # The refund line goes when the refund works.
+        with mock.patch.object(self.g.paypal, "refund", side_effect=lost):
+            with self.assertRaises(GatewayError):
+                self.g.refund(cart_id)
+        self.assertEqual(self.g.refund(cart_id)["status"], "REFUNDED")
+        self.assertIsNone(self.g.status()["paypal"]["last_error"])
+
     def test_P4_each_paypal_mode_has_its_own_state_file(self):
         data = os.path.join(self.tmp, "data")
         keys = {"PAYPAL_CLIENT_ID": "id", "PAYPAL_CLIENT_SECRET": "secret"}

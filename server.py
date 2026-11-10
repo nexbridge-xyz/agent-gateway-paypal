@@ -406,7 +406,8 @@ def paypal_line(gateway, demo: bool = False) -> str:
 
     A failed check is one line here and never a traceback. The reason also goes on the
     PayPal card, so the page says why PayPal will not work, and it is taken off again by
-    the next start whose check succeeds.
+    the next start whose check succeeds. Only that line is taken off: a line that
+    something else left on the card, such as a refund without a clear answer, stays.
     """
     if not gateway.paypal.live:
         return "PayPal simulated" + (" (--demo)" if demo else " (no PAYPAL_CLIENT_ID / SECRET in .env)")
@@ -415,7 +416,7 @@ def paypal_line(gateway, demo: bool = False) -> str:
     except PayPalError as e:
         gateway.paypal_error(STARTUP_ERROR + e.short())
         return "PayPal Sandbox (credential check FAILED: %s)" % e.short()
-    gateway.paypal_clear_error()
+    gateway.paypal_clear_error(STARTUP_ERROR)
     return "PayPal Sandbox (credentials OK)"
 
 
@@ -458,7 +459,7 @@ def main(argv=None):
     Handler.base_url = base.rstrip("/")
 
     pp_line = paypal_line(gateway, args.demo)
-    shown =Handler.base_url or "http://%s:%d" % ("localhost" if host in ("127.0.0.1", "0.0.0.0") else host, port)
+    shown = Handler.base_url or "http://%s:%d" % ("localhost" if host in ("127.0.0.1", "0.0.0.0") else host, port)
     print("")
     print("  Agent Gateway for PayPal  ·  by NexBridge")
     print("  ----------------------------------------")
