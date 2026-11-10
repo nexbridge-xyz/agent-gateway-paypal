@@ -35,6 +35,32 @@ CSP = ("default-src 'self'; script-src 'self'; "
        "frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 
 
+def allowed_hosts(port: int, base_url: str = "") -> set:
+    """Host header values this server answers. Any other value gets 421.
+
+    A page on another domain that is made to resolve to this machine (DNS rebinding)
+    sends its own name as Host and as Origin, so the two matching proves nothing.
+    Allowed: localhost, 127.0.0.1 and [::1] with the port the server listens on,
+    and the host of BASE_URL.
+    """
+    names = ("localhost", "127.0.0.1", "[::1]")
+    hosts = {"%s:%d" % (name, port) for name in names}
+    if port == 80:
+        hosts.update(names)  # browsers leave the default port out
+    url = urllib.parse.urlsplit(base_url or "")
+    if url.hostname:
+        name = "[%s]" % url.hostname if ":" in url.hostname else url.hostname
+        default = 443 if url.scheme == "https" else 80
+        try:
+            base_port = url.port or default
+        except ValueError:
+            base_port = default
+        hosts.add("%s:%d" % (name, base_port))
+        if base_port == default:
+            hosts.add(name)
+    return hosts
+
+
 def load_env(path: str) -> dict:
     """Minimal .env reader: KEY=VALUE lines, # comments, optional quotes. Real env vars win."""
     values = {}
@@ -112,14 +138,23 @@ class Handler(BaseHTTPRequestHandler):
         proto = self.headers.get("X-Forwarded-Proto") or "http"
         return "%s://%s" % (proto, host)
 
+    def _hosts(self) -> set:
+        return allowed_hosts(self.server.server_address[1], self.base_url)
+
+    def _host_ok(self) -> bool:
+        return (self.headers.get("Host") or "").strip().lower() in self._hosts()
+
+    def _unknown_host(self):
+        here = self.base_url or "http://localhost:%d" % self.server.server_address[1]
+        self._error("This server does not answer for that host name. Open it at %s, "
+                    "or set BASE_URL to the address you use." % here, 421)
+
     def _origin_ok(self) -> bool:
         origin = self.headers.get("Origin")
         if not origin:
             # Browsers send Origin on every cross-site POST; a missing one is same-origin or a non-browser client.
             return True
-        host = self.headers.get("Host") or ""
-        allowed = {urllib.parse.urlsplit(self._base()).netloc, host}
-        return urllib.parse.urlsplit(origin).netloc in allowed
+        return urllib.parse.urlsplit(origin).netloc.lower() in self._hosts()
 
     def _body(self) -> dict:
         try:
@@ -155,6 +190,9 @@ class Handler(BaseHTTPRequestHandler):
     # -- routing -----------------------------------------------------------------
     def do_GET(self):
         try:
+            # /healthz carries no data and must answer a hosting platform's probe under any name.
+            if not self._host_ok() and self.path.split("?", 1)[0] != "/healthz":
+                return self._unknown_host()
             self._get()
         except GatewayError as e:
             self._error(str(e), e.status)
@@ -164,6 +202,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
+            if not self._host_ok():
+                return self._unknown_host()
             if not self._origin_ok():
                 return self._error("Cross-origin request refused.", 403)
             self._post()
@@ -348,6 +388,8 @@ def main(argv=None):
     print("  PayPal : %s" % pp_line)
     print("  AI     : %s" % gateway.ai.label)
     print("  Open   : %s" % shown)
+    if host not in ("127.0.0.1", "localhost", "::1") and not Handler.base_url:
+        print("  Hosts  : only localhost requests are answered. Set BASE_URL to serve another address.")
     print("  State  : data/state.json   (Ctrl+C to stop)")
     print("")
     httpd = ThreadingHTTPServer((host, port), Handler)
