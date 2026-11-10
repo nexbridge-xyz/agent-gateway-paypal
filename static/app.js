@@ -713,7 +713,7 @@ async function boot() {
     ev.target.disabled = true;
     try {
       const r = await api("/api/redteam/hijack", {});
-      if (r.status === "DENIED") toast("Denied by the gateway. Even if the AI is fooled, the money isn't.", "ok");
+      if (r.status === "DENIED") toast("Denied by the gateway. Even if the AI is fooled, it can't spend outside the limits you signed.", "ok");
       else toast("Hijack result: " + r.status, "error");
     } catch (e) { toast(e.message, "error"); }
     ev.target.disabled = false;

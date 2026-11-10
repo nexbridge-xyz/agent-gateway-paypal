@@ -72,7 +72,6 @@ python, javascript, html, css, paypal-rest-api, paypal-vault, paypal-orders-v2, 
 ## Try it out
 
 - GitHub: https://github.com/nexbridge-xyz/agent-gateway-paypal
-- (Optional) hosted demo: https://github.com/nexbridge-xyz/agent-gateway-paypal (no hosted instance; run it locally with `python3 server.py --demo`)
 
 ## Testing instructions
 
