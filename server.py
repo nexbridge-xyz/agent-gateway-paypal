@@ -3,8 +3,10 @@
 
     python3 server.py --demo        simulated PayPal + scripted agent, no keys needed
     python3 server.py               uses .env: PayPal sandbox and/or an AI key when set
-    python3 server.py --reset-all   wipe saved state (PayPal connection, device keys, ledger)
+    python3 server.py --reset-all   wipe that mode's saved state (PayPal connection, device keys,
+                                    ledger); with --demo it wipes the demo's state instead
 
+The sandbox and the demo keep separate state files, so nothing signed in one counts in the other.
 Python 3.9+ standard library only.
 """
 from __future__ import annotations
@@ -29,6 +31,7 @@ from app.gateway import Gateway, GatewayError  # noqa: E402
 from app.paypal import VAULT_HINT, PayPalError, PayPalSandbox, PayPalSimulated  # noqa: E402
 
 STATIC = os.path.join(ROOT, "static")
+DATA_DIR = os.path.join(ROOT, "data")
 MAX_BODY = 64 * 1024
 CSP = ("default-src 'self'; script-src 'self'; "
        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
@@ -358,32 +361,57 @@ def sim_approve_page(token: str) -> str:
 </main></body></html>""" % (t, q)
 
 
-def build(args, env: dict):
-    if args.demo:
-        paypal = PayPalSimulated()
-    elif env.get("PAYPAL_CLIENT_ID") and env.get("PAYPAL_CLIENT_SECRET"):
+def paypal_mode(args, env: dict) -> str:
+    """Which PayPal the server talks to: "sandbox" when its keys are set and --demo is not given."""
+    live = not args.demo and env.get("PAYPAL_CLIENT_ID") and env.get("PAYPAL_CLIENT_SECRET")
+    return "sandbox" if live else "simulated"
+
+
+def state_path(mode: str, data_dir: str | None = None) -> str:
+    """The state file of one PayPal mode. Each mode has its own file, so a mandate signed in
+    the demo is never there when the sandbox runs. The sandbox keeps the name data/state.json."""
+    name = "state.json" if mode == "sandbox" else "state-%s.json" % mode
+    return os.path.join(data_dir or DATA_DIR, name)
+
+
+def wipe_state(path: str) -> bool:
+    """Delete one state file, and a half-written copy beside it. True if the file was there."""
+    found = os.path.exists(path)
+    for p in (path, path + ".tmp"):
+        if os.path.exists(p):
+            os.remove(p)
+    return found
+
+
+def build(args, env: dict, data_dir: str | None = None):
+    if paypal_mode(args, env) == "sandbox":
         paypal = PayPalSandbox(env["PAYPAL_CLIENT_ID"], env["PAYPAL_CLIENT_SECRET"], "sandbox")
     else:
         paypal = PayPalSimulated()
     ai = llm.from_env(env, demo=args.demo)
-    state_path = os.path.join(ROOT, "data", "state.json")
-    return Gateway(paypal, ai, state_path)
+    return Gateway(paypal, ai, state_path(paypal.env, data_dir))
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Agent Gateway for PayPal")
     ap.add_argument("--demo", action="store_true", help="simulated PayPal and scripted agent (no keys needed)")
-    ap.add_argument("--reset-all", action="store_true", help="wipe saved state, including the PayPal connection")
+    ap.add_argument("--reset-all", action="store_true",
+                    help="wipe this mode's saved state, including the PayPal connection (with --demo: the demo's)")
     ap.add_argument("--host", default=None)
     ap.add_argument("--port", type=int, default=None)
     args = ap.parse_args(argv)
 
     env = load_env(os.path.join(ROOT, ".env"))
     if args.reset_all:
-        path = os.path.join(ROOT, "data", "state.json")
-        if os.path.exists(path):
-            os.remove(path)
-        print("Saved state wiped (data/state.json).")
+        # Only the file of the mode this command line selects. The other mode's file is left alone.
+        mode = paypal_mode(args, env)
+        path = state_path(mode)
+        shown = os.path.relpath(path, ROOT)
+        print(("Saved state wiped (%s)." if wipe_state(path) else "No saved state to wipe (%s).") % shown)
+        if mode == "sandbox":
+            print("That is the PayPal sandbox state. To wipe the demo's state, add --demo.")
+        else:
+            print("That is the demo's state. The PayPal sandbox state (data/state.json) was not touched.")
         return
 
     host = args.host or env.get("HOST") or "127.0.0.1"
@@ -410,7 +438,7 @@ def main(argv=None):
     print("  Open   : %s" % shown)
     if host not in ("127.0.0.1", "localhost", "::1") and not Handler.base_url:
         print("  Hosts  : only localhost requests are answered. Set BASE_URL to serve another address.")
-    print("  State  : data/state.json   (Ctrl+C to stop)")
+    print("  State  : %s   (Ctrl+C to stop)" % os.path.relpath(gateway.state_path, ROOT))
     print("")
     httpd = ThreadingHTTPServer((host, port), Handler)
     httpd.daemon_threads = True

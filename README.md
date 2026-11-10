@@ -28,7 +28,7 @@ Merchants have the mirror problem: when an agent buys something, who authorised 
 
    | Check | Kind | Fails when |
    |---|---|---|
-   | Mandate signed and active | hard | no mandate, revoked |
+   | Mandate signed and active | hard | no mandate, revoked, or signed for the other PayPal mode |
    | Within dates | hard | today is after `valid_until` |
    | Category allowed | hard | item category not in the mandate |
    | Merchant verified | hard | merchant unverified and `verified_merchants_only` |
@@ -62,7 +62,7 @@ Open <http://localhost:8000> in a current Chrome, Edge, Safari or Firefox (Ed255
 6. **Verify chain**, then **Evidence** on the hotel, and run `python3 tools/verify_evidence.py evidence-<id>.json`.
 7. **Refund** the hotel (budget comes back) or **Revoke mandate** (everything after is denied).
 
-**Reset demo** clears mandates, purchases and the ledger but keeps the PayPal connection and device key. `python3 server.py --reset-all` deletes `data/state.json`: the PayPal connection, the registered device keys, mandates, purchases and the ledger. The signing key in your browser stays, and the page registers it again when it loads. The trip dates are not hard-coded: the demo trip is the first Friday at least 10 days from today, Friday to Sunday.
+**Reset demo** clears mandates, purchases and the ledger but keeps the PayPal connection and device key. The demo and the PayPal sandbox keep separate state files (`data/state-simulated.json` and `data/state.json`), so nothing you sign or buy in one mode is there in the other. `--reset-all` deletes the file of the mode it is run in: `python3 server.py --demo --reset-all` for the demo, `python3 server.py --reset-all` for the sandbox. That removes that mode's PayPal connection, registered device keys, mandates, purchases and ledger. The signing key in your browser stays, and the page registers it again when it loads. The trip dates are not hard-coded: the demo trip is the first Friday at least 10 days from today, Friday to Sunday.
 
 The header always shows what is real and what is simulated: `PayPal simulated` / `PayPal Sandbox`, and `Simulated AI · scripted agent` / the model name. In demo mode the agent's *thinking* is scripted, but the signatures, the gateway checks, the ledger and the evidence are the same code as in live mode.
 
@@ -75,7 +75,7 @@ The header always shows what is real and what is simulated: `PayPal simulated` /
 5. `python3 server.py` (without `--demo`). The startup banner shows whether the credentials work.
 6. **Connect PayPal** takes you to the PayPal sandbox. Log in with the sandbox **Personal** account and approve. Payments then appear as **COMPLETED** orders in the Business sandbox account's activity.
 
-Sandbox only: no real money moves.
+Sandbox only: no real money moves. The sandbox has its own state file (`data/state.json`), so a mandate you signed in demo mode is not carried over: connect PayPal and sign again.
 
 ## Live mode: AI
 
@@ -127,7 +127,7 @@ PayPal has announced support for Google's Agent Payments Protocol (AP2). This pr
 
 - **Signatures:** the server builds the exact string to sign (`context + canonical JSON`); the browser shows it and signs those bytes; the server verifies with Ed25519. A different context string for each record type means a signature for one kind of record cannot be replayed as another.
 - **The model never decides payment.** Prices come from the catalog, the payee is fixed, and the checks are plain code. Merchant listing text is labelled untrusted for the model, but safety does not depend on the model obeying that. Inside the limits you signed, a fooled model can still buy the wrong thing: the gateway caps what it can spend, not what it picks.
-- **Secrets:** only in `.env` (gitignored). The vault token is stored in `data/state.json` (gitignored; set to file mode 600 after every save) and never sent to the agent or the logs. The page shows only its last two characters. The ledger holds a keyed fingerprint of it (HMAC-SHA256); the key stays in `data/state.json`.
+- **Secrets:** only in `.env` (gitignored). The vault token is stored in the state file (`data/state.json` for the sandbox, `data/state-simulated.json` for the demo; gitignored; set to file mode 600 after every save) and never sent to the agent or the logs. The page shows only its last two characters. The ledger holds a keyed fingerprint of it (HMAC-SHA256); the key stays in the state file.
 - **HTTP:** the server answers only for its own names: `localhost`, `127.0.0.1` and `[::1]` with its port, and the host of `BASE_URL`. Any other `Host` gets 421, which stops a page that points its own domain at your machine (DNS rebinding). POSTs with a foreign `Origin` are refused. Request bodies are limited to 64 KB, text that is not valid Unicode is refused, and a client that stays silent for 15 seconds is dropped. Static paths cannot leave `static/`, `nosniff`, a strict CSP (self + Google Fonts), and `Cache-Control: no-store` on API responses. The server binds to `127.0.0.1` by default.
 - **Ledger:** each entry stores the SHA-256 of the previous one, so editing an entry, or deleting one that has entries after it, breaks verification from that point. The chain alone does not show entries removed from its end, or a holder who rebuilds every hash: its head is not anchored outside the server. **Reset demo** clears it.
 - **Evidence:** `tools/verify_evidence.py` shows that a bundle agrees with itself: the signatures verify, the cart and the capture are the ones the ledger recorded, and the chain is intact. It cannot show that the public key belongs to the traveler, or what PayPal really did.

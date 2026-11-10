@@ -1,4 +1,5 @@
-"""HTTP layer: host and origin checks, static path containment, security headers."""
+"""HTTP layer: host and origin checks, static path containment, security headers. Also the state files."""
+import argparse
 import http.client
 import io
 import json
@@ -229,6 +230,55 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(status, 200)            # redirected back to the app, not a server error
         self.assertNotIn(b"Server error", body)
         self.assertTrue(g.status()["paypal"]["last_error"].startswith("TIMEOUT"))
+
+
+class StateFileTest(unittest.TestCase):
+    """One state file per PayPal mode. Nothing here touches the real data/ directory."""
+    KEYS = {"PAYPAL_CLIENT_ID": "id", "PAYPAL_CLIENT_SECRET": "secret"}
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_paypal_mode(self):
+        demo, plain = argparse.Namespace(demo=True), argparse.Namespace(demo=False)
+        self.assertEqual(server.paypal_mode(plain, self.KEYS), "sandbox")
+        self.assertEqual(server.paypal_mode(demo, self.KEYS), "simulated")      # --demo wins over keys
+        self.assertEqual(server.paypal_mode(plain, {}), "simulated")
+        self.assertEqual(server.paypal_mode(plain, {"PAYPAL_CLIENT_ID": "id"}), "simulated")
+
+    def test_state_path(self):
+        self.assertEqual(server.state_path("sandbox", self.tmp), os.path.join(self.tmp, "state.json"))
+        self.assertEqual(server.state_path("simulated", self.tmp), os.path.join(self.tmp, "state-simulated.json"))
+        # The sandbox keeps the file it always had.
+        self.assertEqual(server.state_path("sandbox"), os.path.join(server.ROOT, "data", "state.json"))
+        self.assertEqual(os.path.dirname(server.state_path("simulated")), os.path.join(server.ROOT, "data"))
+
+    def test_wipe_state_deletes_one_mode(self):
+        for name in ("state.json", "state-simulated.json", "state-simulated.json.tmp"):
+            with open(os.path.join(self.tmp, name), "w") as f:
+                f.write("{}")
+        self.assertTrue(server.wipe_state(server.state_path("simulated", self.tmp)))
+        self.assertEqual(os.listdir(self.tmp), ["state.json"])
+        self.assertFalse(server.wipe_state(server.state_path("simulated", self.tmp)))  # nothing left to wipe
+        self.assertEqual(os.listdir(self.tmp), ["state.json"])
+
+    def test_reset_all_wipes_only_the_mode_it_is_run_in(self):
+        # main() runs with the .env reader and the deletion replaced, so no file is read or removed.
+        for argv, env, mode in ((["--reset-all"], self.KEYS, "sandbox"),
+                                (["--demo", "--reset-all"], self.KEYS, "simulated"),
+                                (["--reset-all"], {}, "simulated")):
+            with self.subTest(argv=argv, mode=mode):
+                with mock.patch.object(server, "load_env", return_value=dict(env)), \
+                        mock.patch.object(server, "wipe_state", return_value=True) as wipe, \
+                        mock.patch.object(server, "build") as build, \
+                        mock.patch("sys.stdout", new=io.StringIO()) as out:
+                    server.main(argv)
+                wipe.assert_called_once_with(server.state_path(mode))
+                build.assert_not_called()                                              # the server is not started
+                self.assertIn(os.path.join("data", os.path.basename(server.state_path(mode))), out.getvalue())
 
 
 if __name__ == "__main__":

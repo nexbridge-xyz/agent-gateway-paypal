@@ -187,7 +187,7 @@ class Gateway:
 
         The ledger goes to the browser and into every evidence bundle. A plain hash of a
         short token would let anyone test guesses against it; without the key that is not
-        possible. The key is made once and stays in state.json. Call with the lock held.
+        possible. The key is made once and stays in the state file. Call with the lock held.
         """
         keys = self.state.setdefault("secrets", {})
         if not keys.get("fingerprint_key"):
@@ -378,6 +378,20 @@ class Gateway:
                 skus.append(cart["sku"])
         return {"committed": committed, "reserved": reserved, "count": count, "skus": skus}
 
+    def _mandate_status(self, m: dict | None) -> str:
+        """The mandate's status as the checks see it.
+
+        A mandate names the PayPal environment it was signed for. Each mode has its own state
+        file, so the two normally match. A mandate for another environment (a copied file, or
+        one from before the files were split) does not count as active here.
+        """
+        if not m:
+            return "none"
+        signed_for = (m["record"].get("merchant") or {}).get("paypal_env")
+        if signed_for != self.paypal.env:
+            return "signed for PayPal %s, not %s" % (signed_for, self.paypal.env)
+        return m["status"]
+
     def mandate_view(self) -> dict | None:
         with self.lock:
             m = self.state["mandate"]
@@ -387,7 +401,7 @@ class Gateway:
             total = to_minor(m["record"]["constraints"]["total_budget"], self.currency)
             left = max(0, total - usage["committed"] - usage["reserved"])
             return {
-                "id": m["record"]["id"], "status": m["status"], "record": m["record"],
+                "id": m["record"]["id"], "status": self._mandate_status(m), "record": m["record"],
                 "key_id": m["key_id"], "signature_fingerprint": fingerprint(m["signature"]),
                 "activated_at": m["activated_at"], "revoked_at": m["revoked_at"], "notes": m.get("notes") or [],
                 "budget": {"total": value_str(total, self.currency),
@@ -409,8 +423,9 @@ class Gateway:
             v = self.mandate_view()
             carts = [self.state["carts"][c] for c in self.state["cart_order"]]
             mine = [c for c in carts if c["mandate_id"] == m["record"]["id"]]
+            status = self._mandate_status(m)
             return {
-                "active": m["status"] == "active", "status": m["status"],
+                "active": status == "active", "status": status,
                 "summary": m["record"]["summary"], "constraints": m["record"]["constraints"],
                 "trip": m["record"]["trip"],
                 "budget_left": display(to_minor(v["budget"]["left"], self.currency), self.currency),
@@ -481,7 +496,7 @@ class Gateway:
         with self.lock:
             m = self.state["mandate"]
             cart_id = new_id("cart")
-            status = m["status"] if m else "none"
+            status = self._mandate_status(m)
             mandate = m["record"] if m else {"constraints": {
                 "total_budget": "0", "auto_approve_limit": "0", "allowed_categories": [], "max_purchases": 0,
                 "valid_until": "1970-01-01", "verified_merchants_only": True}}
@@ -646,7 +661,8 @@ class Gateway:
             cart["prepared_approval"] = {"record": record, "signed_string": signing}
             # Show the traveler the checks as they are now, not as they were.
             item = dict(cart["item"], price_minor=cart["price_minor"])
-            now = policy.evaluate(m["record"], m["status"], item, self._usage(exclude=cart_id), self.currency)
+            now = policy.evaluate(m["record"], self._mandate_status(m), item, self._usage(exclude=cart_id),
+                                  self.currency)
             self.save()
             return {"cart_id": cart_id, "record": record, "signing_string": signing, "key_id": key_id,
                     "checks": now["checks"]}
@@ -671,7 +687,7 @@ class Gateway:
             # Run the hard checks again: the mandate may be revoked or the budget used up.
             m = self.state["mandate"]
             item = dict(cart["item"], price_minor=cart["price_minor"])
-            status = m["status"] if m and m["record"]["id"] == cart["mandate_id"] else "replaced"
+            status = self._mandate_status(m) if m and m["record"]["id"] == cart["mandate_id"] else "replaced"
             again = policy.evaluate(m["record"], status, item, self._usage(exclude=cart_id), self.currency)
             hard = [c for c in again["checks"] if not c["ok"] and c["kind"] == policy.HARD]
             again["decided_at"] = now_iso()

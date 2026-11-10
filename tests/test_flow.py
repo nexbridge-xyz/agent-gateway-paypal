@@ -1,5 +1,6 @@
 """The full DEMO flow through the gateway: simulated PayPal, scripted agent,
 real signatures, real ledger, and the offline evidence verifier."""
+import argparse
 import copy
 import hashlib
 import hmac
@@ -10,6 +11,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+import server
 from app import ed25519, llm
 from app.gateway import Gateway, GatewayError, payment_status
 from app.paypal import PAYMENT_TIMEOUT_TEXT, PAYMENT_UNKNOWN_HINT, PayPalError, PayPalSimulated
@@ -436,6 +438,63 @@ class FlowTest(unittest.TestCase):
         g2.reset()
         self.assertEqual(g2.state["secrets"]["fingerprint_key"], key)
         self.assertEqual(g2._vault_fingerprint(vault), fp)
+
+    def test_P4_each_paypal_mode_has_its_own_state_file(self):
+        data = os.path.join(self.tmp, "data")
+        keys = {"PAYPAL_CLIENT_ID": "id", "PAYPAL_CLIENT_SECRET": "secret"}
+        demo_mode, sandbox_mode = argparse.Namespace(demo=True), argparse.Namespace(demo=False)
+        # Sign a mandate and buy a ticket in the demo.
+        self.g = server.build(demo_mode, {}, data)
+        self.kid = self.g.register_device(b64url(ed25519.public_key(self.sk)))["key_id"]
+        self.connect()
+        self.sign_mandate()
+        self.assertEqual(self.g.request_purchase("R-101", "train")["status"], "PAID")
+        self.assertEqual(os.path.basename(self.g.state_path), "state-simulated.json")
+        # The sandbox starts from its own file: none of that is there.
+        sandbox = server.build(sandbox_mode, keys, data)
+        self.assertEqual((sandbox.paypal.env, os.path.basename(sandbox.state_path)), ("sandbox", "state.json"))
+        status = sandbox.status()
+        self.assertIsNone(status["mandate"])
+        self.assertEqual((status["carts"], status["devices"], status["paypal"]["status"]), ([], 0, "disconnected"))
+        self.assertEqual(sandbox.ledger_entries(), [])
+        self.assertEqual(sandbox.request_purchase("R-101", "train")["status"], "DENIED")   # no mandate here
+        # What the sandbox saves does not reach the demo's file either.
+        self.assertEqual(sorted(os.listdir(data)), ["state-simulated.json", "state.json"])
+        demo_again = server.build(demo_mode, keys, data)                                   # --demo wins over keys
+        self.assertEqual(demo_again.status()["mandate"]["status"], "active")
+        self.assertEqual([c["status"] for c in demo_again.status()["carts"]], ["PAID"])
+        # Without PayPal keys the server is the simulator too, so it uses the demo's file.
+        self.assertEqual(server.build(sandbox_mode, {}, data).state_path, demo_again.state_path)
+
+    def test_P4_mandate_signed_for_another_paypal_mode_is_not_active(self):
+        # Each mode has its own file now, but a copied file, or one from before the split, can
+        # still hold a mandate that was signed in the other mode. It must not pay here.
+        self.connect()
+        self.sign_mandate()
+        self.g.request_purchase("H-301", "hotel")                 # waits for a signature
+        hotel = self.carts()["H-301"]["id"]
+        other = PayPalSimulated()
+        other.env = "sandbox"
+        g2 = Gateway(other, llm.ScriptedAI(0), os.path.join(self.tmp, "state.json"))
+        g2.paypal_begin("http://localhost:8000")
+        g2.paypal_finish({})
+        why = "signed for PayPal simulated, not sandbox"
+        out = g2.request_purchase("R-101", "train")
+        self.assertEqual(out["status"], "DENIED")
+        self.assertIn(why, out["why"])
+        checks = g2.state["carts"][g2.state["cart_order"][-1]]["decision"]["checks"]
+        self.assertEqual(len(checks), 8)                          # part of an existing check, not a ninth
+        self.assertEqual([c["key"] for c in checks if not c["ok"]], ["mandate_active"])
+        # The page and the agent are told the same thing.
+        self.assertEqual(g2.status()["mandate"]["status"], why)
+        self.assertEqual((g2.tool_get_mandate()["active"], g2.tool_get_mandate()["status"]), (False, why))
+        # A purchase that was waiting under that mandate is denied when it is approved.
+        prepared = g2.prepare_approval(hotel, self.kid)
+        self.assertIn("mandate_active", [c["key"] for c in prepared["checks"] if not c["ok"]])
+        self.assertEqual(g2.approve(hotel, self.sign(prepared["signing_string"]))["status"], "DENIED")
+        self.assertEqual(g2.status()["mandate"]["budget"]["paid"], "0.00")
+        # In its own mode the mandate works as before.
+        self.assertEqual(self.g.request_purchase("R-101", "train")["status"], "PAID")
 
     def test_evidence_is_gone_after_a_new_mandate_or_a_reset(self):
         self.connect()

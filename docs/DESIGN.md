@@ -63,11 +63,11 @@ sequenceDiagram
     B->>S: GET /paypal/return
     S->>P: POST /v3/vault/payment-tokens (paypal_finish, create_payment_token)
     P-->>S: vault token, customer id, payer email
-    S->>S: store vault token in data/state.json, ledger PAYPAL_CONNECTED
+    S->>S: store vault token in the state file, ledger PAYPAL_CONNECTED
     S-->>B: 302 redirect to /?paypal=connected
 ```
 
-The ledger entry stores a keyed fingerprint of the vault token (HMAC-SHA256), not the token. The key is random, is made on first use and stays in `data/state.json`, so the fingerprint cannot be used to test guesses of the token. In demo mode `PayPalSimulated` returns a link to `/paypal/sim-approve`, a page labelled "Simulated wallet approval (demo mode)".
+The ledger entry stores a keyed fingerprint of the vault token (HMAC-SHA256), not the token. The key is random, is made on first use and stays in the state file, so the fingerprint cannot be used to test guesses of the token. In demo mode `PayPalSimulated` returns a link to `/paypal/sim-approve`, a page labelled "Simulated wallet approval (demo mode)".
 
 ### 3.2 Draft and sign the Intent Mandate
 
@@ -262,7 +262,7 @@ Auto-approved carts are not signed by anyone. Their authority is the Intent Mand
 
 | # | Key | Kind | Fails when |
 |---|---|---|---|
-| 1 | `mandate_active` | hard | No mandate, or its status is not `active` (revoked or replaced) |
+| 1 | `mandate_active` | hard | No mandate, or its status is not `active` (revoked or replaced), or it was signed for another PayPal environment than the one the server runs in (`Gateway._mandate_status`) |
 | 2 | `time_window` | hard | Today's UTC date is after `valid_until` |
 | 3 | `category` | hard | The item's category is not in `allowed_categories` |
 | 4 | `merchant` | hard | The merchant is not verified and `verified_merchants_only` is true |
@@ -300,7 +300,7 @@ The HTTP server also sends `X-Content-Type-Options: nosniff`, a Content Security
 - **A compromised traveler device or browser.** Whoever controls the browser can sign with the device key.
 - **A compromised PayPal account or PayPal app credentials.**
 - **Wrong purchases inside the limits.** A model fooled by merchant text can still buy the wrong thing inside the signed limits, for example a second seat on the same train. The checks cap what it can spend, not what it picks.
-- **The holder of the ledger.** The head of the hash chain is not anchored anywhere outside the server. Whoever can write `data/state.json` can cut entries off the end or rebuild every hash, and **Reset demo** clears the ledger. An evidence bundle shows that it agrees with itself. It cannot show that the public key in it belongs to the traveler, or what PayPal really did.
+- **The holder of the ledger.** The head of the hash chain is not anchored anywhere outside the server. Whoever can write the state file can cut entries off the end or rebuild every hash, and **Reset demo** clears the ledger. An evidence bundle shows that it agrees with itself. It cannot show that the public key in it belongs to the traveler, or what PayPal really did.
 - **Anyone who can reach the server.** There is no login (see section 8).
 
 **Where secrets live:**
@@ -308,8 +308,8 @@ The HTTP server also sends `X-Content-Type-Options: nosniff`, a Content Security
 | Secret | Where |
 |---|---|
 | Device signing key | The traveler's browser (IndexedDB), non-extractable. The server stores only the public key |
-| PayPal vault token | `data/state.json` on the server (gitignored; set to file mode 600 after every save). The UI shows only its last two characters. The ledger stores a keyed fingerprint (HMAC-SHA256). Never in events, evidence or logs |
-| Key of the vault token fingerprint | `data/state.json` only (under `secrets`). Never sent anywhere |
+| PayPal vault token | The state file on the server: `data/state.json` for the sandbox, `data/state-simulated.json` for the demo (gitignored; set to file mode 600 after every save). The UI shows only its last two characters. The ledger stores a keyed fingerprint (HMAC-SHA256). Never in events, evidence or logs |
+| Key of the vault token fingerprint | The state file only (under `secrets`). Never sent anywhere |
 | PayPal client id and secret, AI API keys | `.env` on the server (gitignored) |
 | PayPal access token | Server memory only |
 
@@ -330,7 +330,7 @@ This project follows the shape of the Agent Payments Protocol (AP2): an Intent M
 - **Sandbox only.** `server.py` creates only the sandbox PayPal client. All amounts are in USD.
 - **Demo catalog.** Ten fictional items are hard-coded in `app/catalog.py`. There is no real merchant behind them, and prices do not change.
 - **One traveler, one mandate.** There is one active mandate at a time. Approvals must be signed with the key of the device that signed the mandate. If the browser's site data is cleared, the key is lost and a new mandate is needed.
-- **State in a JSON file.** `data/state.json` is rewritten after every change. Locking is in-process (`threading.RLock`), so only one server process should use the file.
+- **State in a JSON file, one per PayPal mode.** The sandbox uses `data/state.json` and the demo uses `data/state-simulated.json` (`state_path` in `server.py`), so a mandate signed in one mode is not there in the other. The signed mandate also names its PayPal environment, and the `mandate_active` check fails when that is not the environment the server runs in. The file is rewritten after every change. Locking is in-process (`threading.RLock`), so only one server process should use a file.
 - **No login.** The server has no user accounts. Anyone who can reach it can use it: any client can register its own device key and sign a new mandate, which replaces the current one. It binds to `127.0.0.1` by default; setting `HOST` changes that. Under any address other than localhost it answers only when `BASE_URL` names that address. Do not host it with real keys; a hosted demo must run with `--demo`.
 - **No webhooks or later status checks.** The status is what the Orders call returns, plus one read-back right after. A capture that stays `PENDING` is not checked again, and later reversals or disputes are not seen.
 - **An unknown payment result is not resolved.** When PayPal's answer is lost or unclear, the cart becomes `PAYMENT_UNKNOWN` and keeps its amount in the budget. The gateway does not ask PayPal again later, and such a cart cannot be refunded or released in the UI; only **Reset demo** clears it. The traveler has to check the PayPal account.
@@ -399,4 +399,4 @@ This project follows the shape of the Agent Payments Protocol (AP2): an Intent M
 - **Live mode:** copy `.env.example` to `.env`. Fill in the client id and secret of your own PayPal sandbox app with Save payment methods enabled (see the README), and optionally `ANTHROPIC_API_KEY`. Then run `python3 server.py`. The startup banner shows whether the PayPal credentials work and which AI is used.
 - **Tests:** `python3 -m unittest discover tests`. They need no network and no keys.
 - **Evidence:** in the UI, click **Evidence** on a purchase, then run `python3 tools/verify_evidence.py evidence-<cart id>.json`. The exit code is 0 only when every check passes.
-- **Reset:** **Reset demo** in the UI clears mandates, purchases, events and the ledger, and keeps the PayPal connection and device keys. `python3 server.py --reset-all` deletes `data/state.json`.
+- **Reset:** **Reset demo** in the UI clears mandates, purchases, events and the ledger, and keeps the PayPal connection and device keys. `--reset-all` deletes the state file of the mode it is run in: `python3 server.py --reset-all` deletes `data/state.json` (sandbox), and `python3 server.py --demo --reset-all` deletes `data/state-simulated.json` (demo).
