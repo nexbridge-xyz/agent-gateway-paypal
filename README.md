@@ -2,6 +2,8 @@
 
 **Let an AI agent pay through PayPal, only inside limits you signed on your own device, with evidence anyone can check.**
 
+**Demo video (2:39):** https://youtu.be/ZOB1QYYq0zg
+
 ![Agent Gateway: the agent chat on the left, the gateway on the right](docs/screenshot.png)
 
 Built for the PayPal AI Hackathon (Oct 1 – Nov 12, 2026) by NexBridge, a Tokyo startup building payment infrastructure for licensed financial institutions.
