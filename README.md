@@ -113,6 +113,18 @@ Every write sends `PayPal-Request-Id` (for a payment, the cart id; for a refund,
 
 Anything other than `COMPLETED` is shown as it is and never marked as paid. PayPal errors are shown with their `name`, `message`, first `details[].issue` and `debug_id`.
 
+## Tools used
+
+| Tool | What it does here |
+|---|---|
+| PayPal REST APIs (sandbox) | Vault, Orders v2 and refunds, see [PayPal APIs used](#paypal-apis-used) |
+| Claude API, `claude-sonnet-5-5` | Drafts the Intent Mandate from plain English (structured outputs) and runs the travel agent with three strict tools |
+| AG Grid Community 36.3.0 (sponsor tool) | Shows the hash-chained ledger as a grid: dark Quartz theme, sortable and resizable columns, rows keyed by sequence number, and a click on a row opens that entry's JSON. Vendored in `static/vendor/`, no build step |
+| WebCrypto (Ed25519) | The traveler's non-extractable signing key in the browser |
+| Python 3.9+ standard library | Server, gateway, ledger and the offline verifier |
+| Claude Code | We wrote the code and docs with it |
+| Kokoro TTS | AI voice-over of the demo video |
+
 ## Mapping to AP2
 
 PayPal has announced support for Google's Agent Payments Protocol (AP2). This project is **AP2-style**, built on today's PayPal sandbox APIs. It is not an AP2 implementation and not AP2-compliant.
