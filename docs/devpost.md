@@ -40,6 +40,7 @@ We built it with Claude Code.
 - **AI:** Claude (Sonnet 5.5 by default) drafts the mandate with structured outputs and runs the agent with strict tool use. Without a key, a scripted agent runs the same tools through the same gateway, and the UI says so.
 - **Signatures:** WebCrypto Ed25519 in the browser (non-extractable key in IndexedDB), verified in Python by a small RFC 8032 implementation. The server builds the exact string to sign, with a different context string per record type.
 - **Ledger:** append-only, each entry stores the SHA-256 of the previous one.
+- **Demo video:** a screen recording of one live run on the PayPal sandbox, with an AI voice-over (Kokoro TTS).
 
 ### Challenges we ran into
 
@@ -72,6 +73,7 @@ python, javascript, html, css, paypal-rest-api, paypal-vault, paypal-orders-v2, 
 ## Try it out
 
 - GitHub: https://github.com/nexbridge-xyz/agent-gateway-paypal
+- Demo video: https://youtu.be/ZOB1QYYq0zg
 
 ## Testing instructions
 
